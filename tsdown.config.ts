@@ -34,6 +34,13 @@ const shared = {
     "onnxruntime-web",
     "@anthropic-ai/claude-agent-sdk",
     "@anthropic-ai/sdk",
+    // LanceDB ships platform-specific native .node binaries via
+    // @lancedb/lancedb-<platform> sub-packages, and apache-arrow carries
+    // its own native bits. Bundling would inline unresolvable native paths
+    // (same hazard as onnxruntime above). Both are optionalDependencies —
+    // only the lancedb vector/lexical backend loads them at runtime.
+    "@lancedb/lancedb",
+    "apache-arrow",
   ] as const,
 };
 
