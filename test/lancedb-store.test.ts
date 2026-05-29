@@ -165,3 +165,80 @@ describe.skipIf(!lancedbAvailable)("LanceDB vector backend (contract)", () => {
     }
   });
 });
+
+describe.skipIf(!lancedbAvailable)("LanceDB graph KV backend (contract)", () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "agentmemory-lance-graph-"));
+  const NODES = "mem:graph:nodes";
+  const EDGES = "mem:graph:edges";
+  const HISTORY = "mem:graph:edge-history";
+
+  afterAll(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  async function openGraph(dir: string) {
+    const { graphKv } = await createLanceBackends({
+      kv: null as never,
+      dataDir: dir,
+      dimensions: DIMS,
+      backend: "lancedb",
+    });
+    if (!graphKv) throw new Error("graphKv missing from lancedb backends");
+    return graphKv;
+  }
+
+  it("set/get round-trips a JSON object and returns null for misses", async () => {
+    const g = await openGraph(dataDir);
+    const node = { id: "gn_1", type: "concept", name: "lancedb", properties: {} };
+    await g.set(NODES, node.id, node);
+    expect(await g.get(NODES, "gn_1")).toEqual(node);
+    expect(await g.get(NODES, "missing")).toBeNull();
+  });
+
+  it("list returns every row for a scope, parsed", async () => {
+    const g = await openGraph(dataDir);
+    await g.set(NODES, "gn_2", { id: "gn_2", type: "file", name: "x.ts" });
+    const nodes = await g.list<{ id: string }>(NODES);
+    expect(nodes.map((n) => n.id).sort()).toEqual(["gn_1", "gn_2"]);
+  });
+
+  it("keys are namespaced by scope (same id in two scopes is independent)", async () => {
+    const g = await openGraph(dataDir);
+    // An edge and its history legitimately share a "ge_" id - the composite
+    // (scope,key) identity must keep them separate.
+    await g.set(EDGES, "ge_1", { id: "ge_1", stale: false });
+    await g.set(HISTORY, "ge_1", { id: "ge_1", stale: true });
+    expect((await g.get<{ stale: boolean }>(EDGES, "ge_1"))!.stale).toBe(false);
+    expect((await g.get<{ stale: boolean }>(HISTORY, "ge_1"))!.stale).toBe(true);
+    expect(await g.list(EDGES)).toHaveLength(1);
+    expect(await g.list(HISTORY)).toHaveLength(1);
+  });
+
+  it("set upserts on a repeat scope+key", async () => {
+    const g = await openGraph(dataDir);
+    await g.set(NODES, "gn_1", { id: "gn_1", name: "updated" });
+    expect((await g.get<{ name: string }>(NODES, "gn_1"))!.name).toBe("updated");
+    expect(await g.list(NODES)).toHaveLength(2); // still gn_1 + gn_2
+  });
+
+  it("delete removes only the targeted scope+key", async () => {
+    const g = await openGraph(dataDir);
+    await g.delete(NODES, "gn_2");
+    expect(await g.get(NODES, "gn_2")).toBeNull();
+    expect(await g.list(NODES)).toHaveLength(1);
+    // The same-id edge/history rows are untouched.
+    expect(await g.get(EDGES, "ge_1")).not.toBeNull();
+  });
+
+  it("reopens persisted graph rows from disk", async () => {
+    const reopenDir = mkdtempSync(join(tmpdir(), "agentmemory-lance-graph-reopen-"));
+    try {
+      const first = await openGraph(reopenDir);
+      await first.set(NODES, "gn_p", { id: "gn_p", name: "persisted" });
+      const second = await openGraph(reopenDir);
+      expect((await second.get<{ name: string }>(NODES, "gn_p"))!.name).toBe("persisted");
+    } finally {
+      rmSync(reopenDir, { recursive: true, force: true });
+    }
+  });
+});

@@ -25,6 +25,11 @@ import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { createPersistenceBackends } from "./state/vector-store.js";
 import {
+  GraphRoutingKV,
+  backfillGraphIfEmpty,
+  type GraphKvStore,
+} from "./state/graph-kv-router.js";
+import {
   KvIndexBlobStore,
   type IndexBlobStore,
 } from "./state/index-blob-store.js";
@@ -222,29 +227,51 @@ async function main() {
 
   writeWorkerPidfile();
 
-  const kv = new StateKV(sdk);
+  const baseKv = new StateKV(sdk);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
-  const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
   // Vector + BM25 persistence backends. With an embedding provider the
   // selected VECTOR_BACKEND owns the vector index (and, for lancedb, the
-  // BM25 blob too); without one there are no vectors and BM25 stays in the
-  // iii KV. createPersistenceBackends opens lancedb's table and caches its
-  // row count before returning, so VectorIndex.size is valid at boot below.
+  // BM25 blob + graph KV too); without one there are no vectors and BM25 stays
+  // in the iii KV. createPersistenceBackends opens lancedb's tables and caches
+  // its row count before returning, so VectorIndex.size is valid at boot below.
   let vectorIndex: VectorIndex | null = null;
   let indexBlobStore: IndexBlobStore;
+  let graphKv: GraphKvStore | undefined;
   if (embeddingProvider) {
     const backends = await createPersistenceBackends({
-      kv,
+      kv: baseKv,
       dataDir: config.dataDir,
       dimensions: embeddingProvider.dimensions,
       backend: getVectorBackendKind(),
     });
     vectorIndex = backends.vector;
     indexBlobStore = backends.blobStore;
+    graphKv = backends.graphKv;
   } else {
-    indexBlobStore = new KvIndexBlobStore(kv);
+    indexBlobStore = new KvIndexBlobStore(baseKv);
+  }
+
+  // When a self-persisting backend owns its files (lancedb), route the graph's
+  // KV scopes to it - out of the iii KV - and migrate the existing graph once.
+  // Otherwise the graph stays in the iii KV via the plain StateKV. Every other
+  // scope always falls through to the iii KV regardless.
+  const kv = graphKv ? new GraphRoutingKV(sdk, graphKv) : baseKv;
+  const metricsStore = new MetricsStore(kv);
+  if (graphKv) {
+    try {
+      const r = await backfillGraphIfEmpty(baseKv, graphKv);
+      bootLog(
+        r.migrated
+          ? `Graph backend: LanceDB (migrated ${r.nodes} nodes, ${r.edges} edges, ${r.history} history from iii KV)`
+          : `Graph backend: LanceDB (already populated: ${r.nodes} nodes, ${r.edges} edges)`,
+      );
+    } catch (err) {
+      bootLog(
+        `Graph backfill skipped (error): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   setVectorIndex(vectorIndex);
@@ -548,12 +575,16 @@ async function main() {
   // version; without periodic compaction the index accrues unbounded
   // fragments. Hourly optimize()+prune keeps it tight. No-op for the
   // in-memory backend; unref so it never holds the process open at exit.
-  if (vectorIndex) {
+  if (vectorIndex || graphKv) {
     const vi = vectorIndex;
+    const gkv = graphKv;
     const optimizeTimer = setInterval(
       () => {
-        vi.optimize().catch((err) => {
+        vi?.optimize().catch((err) => {
           console.warn(`[agentmemory] vector index optimize failed:`, err);
+        });
+        gkv?.optimize?.().catch((err) => {
+          console.warn(`[agentmemory] graph kv optimize failed:`, err);
         });
       },
       60 * 60 * 1000,

@@ -11,6 +11,7 @@ import {
   type LifecycleFields,
 } from "../vector-index.js";
 import type { IndexBlobStore } from "../index-blob-store.js";
+import type { GraphKvStore } from "../graph-kv-router.js";
 
 // ---------------------------------------------------------------------------
 // LanceDB storage backend (VECTOR_BACKEND=lancedb).
@@ -103,6 +104,7 @@ interface LanceModule {
 
 const MEMORIES_TABLE = "memories";
 const BLOBS_TABLE = "index_blobs";
+const GRAPH_KV_TABLE = "graph_kv";
 
 // Default Adaptive Knowledge Lifecycle values for a freshly-added vector.
 // Mirrors LifecycleFields; written only on a genuine insert and PRESERVED
@@ -586,6 +588,114 @@ class LanceIndexBlobStore implements IndexBlobStore {
   }
 }
 
+// Knowledge-graph KV backend: a generic (scope, key, value) table that gives
+// the graph its own on-disk files instead of the iii KV. Each node/edge/history
+// record is one row; the value column holds the JSON-serialized object, so the
+// stored shapes (GraphNode/GraphEdge) round-trip unchanged. The composite
+// identity is `scope + " " + key` in the `pk` column (neither a graph scope
+// nor a generated id contains a space), used ONLY as the mergeInsert match
+// key; get/delete filter on `scope AND key`, list filters on `scope`. Graph
+// ids collide across scopes (an edge and its history share a "ge_" id), so a
+// composite key is required.
+class LanceGraphKvStore implements GraphKvStore {
+  private table: LanceTable | null = null;
+
+  constructor(
+    private readonly conn: LanceConnection,
+    private readonly arrow: ArrowModule,
+  ) {}
+
+  private buildSchema(): unknown {
+    const a = this.arrow;
+    return new a.Schema([
+      new a.Field("pk", new a.Utf8(), false),
+      new a.Field("scope", new a.Utf8(), false),
+      new a.Field("key", new a.Utf8(), false),
+      new a.Field("value", new a.Utf8(), true),
+    ]);
+  }
+
+  async init(): Promise<void> {
+    const names = await this.conn.tableNames();
+    this.table = names.includes(GRAPH_KV_TABLE)
+      ? await this.conn.openTable(GRAPH_KV_TABLE)
+      : await this.conn.createEmptyTable(GRAPH_KV_TABLE, this.buildSchema());
+  }
+
+  private requireTable(): LanceTable {
+    if (!this.table) {
+      throw new Error("[agentmemory] LanceGraphKvStore used before init()");
+    }
+    return this.table;
+  }
+
+  private pk(scope: string, key: string): string {
+    return `${scope} ${key}`;
+  }
+
+  async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
+    const table = this.requireTable();
+    await table
+      .mergeInsert("pk")
+      .whenMatchedUpdateAll()
+      .whenNotMatchedInsertAll()
+      .execute([
+        { pk: this.pk(scope, key), scope, key, value: JSON.stringify(value) },
+      ]);
+    return value;
+  }
+
+  async get<T = unknown>(scope: string, key: string): Promise<T | null> {
+    const table = this.requireTable();
+    const rows = await table
+      .query()
+      .where(`scope = ${sqlString(scope)} AND key = ${sqlString(key)}`)
+      .select(["value"])
+      .limit(1)
+      .toArray();
+    if (rows.length === 0) return null;
+    return this.parse<T>(rows[0].value);
+  }
+
+  async delete(scope: string, key: string): Promise<void> {
+    const table = this.requireTable();
+    await table.delete(
+      `scope = ${sqlString(scope)} AND key = ${sqlString(key)}`,
+    );
+  }
+
+  async list<T = unknown>(scope: string): Promise<T[]> {
+    const table = this.requireTable();
+    // No .limit(): a plain query returns every matching row (the default-10
+    // cap applies only to vector search). The graph is small (hundreds of
+    // rows), so a full per-scope scan is cheap.
+    const rows = await table
+      .query()
+      .where(`scope = ${sqlString(scope)}`)
+      .select(["value"])
+      .toArray();
+    const out: T[] = [];
+    for (const r of rows) {
+      const parsed = this.parse<T>(r.value);
+      if (parsed !== null) out.push(parsed);
+    }
+    return out;
+  }
+
+  async optimize(): Promise<void> {
+    await this.requireTable().optimize({ cleanupOlderThan: new Date() });
+  }
+
+  private parse<T>(v: unknown): T | null {
+    if (typeof v !== "string") return null;
+    try {
+      return JSON.parse(v) as T;
+    } catch {
+      return null;
+    }
+  }
+}
+
 export async function createLanceBackends(
   opts: CreateBackendsOptions,
 ): Promise<PersistenceBackends> {
@@ -624,8 +734,12 @@ export async function createLanceBackends(
   const blobStore = new LanceIndexBlobStore(conn, arrow);
   await blobStore.init();
 
+  const graphKv = new LanceGraphKvStore(conn, arrow);
+  await graphKv.init();
+
   return {
     vector: new VectorIndex(vectorBackend),
     blobStore,
+    graphKv,
   };
 }
