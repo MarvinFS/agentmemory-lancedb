@@ -5,7 +5,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerSearchFunction, getSearchIndex, rebuildIndex, setVectorIndex, setEmbeddingProvider, getVectorIndex } from "../src/functions/search.js";
-import { VectorIndex } from "../src/state/vector-index.js";
+import { VectorIndex, MemoryVectorIndex } from "../src/state/vector-index.js";
 import { KV } from "../src/state/schema.js";
 import type { CompressedObservation, Session } from "../src/types.js";
 
@@ -193,7 +193,7 @@ describe("mem::search", () => {
         _texts.map(() => new Float32Array([0.1, 0.2, 0.3])),
     };
     setEmbeddingProvider(mockEmbedder);
-    setVectorIndex(new VectorIndex());
+    setVectorIndex(new VectorIndex(new MemoryVectorIndex()));
 
     await rebuildIndex(kv as never);
 

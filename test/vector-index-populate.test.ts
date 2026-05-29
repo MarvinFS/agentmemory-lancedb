@@ -10,7 +10,7 @@ vi.mock("../src/state/keyed-mutex.js", () => ({
 
 import { registerRememberFunction } from "../src/functions/remember.js";
 import { setVectorIndex, setEmbeddingProvider, getVectorIndex } from "../src/functions/search.js";
-import { VectorIndex } from "../src/state/vector-index.js";
+import { VectorIndex, MemoryVectorIndex } from "../src/state/vector-index.js";
 import type { EmbeddingProvider } from "../src/types.js";
 
 function mockKV() {
@@ -60,7 +60,7 @@ describe("vector index population on remember", () => {
   let vectorIndex: VectorIndex;
 
   beforeEach(() => {
-    vectorIndex = new VectorIndex();
+    vectorIndex = new VectorIndex(new MemoryVectorIndex());
     setVectorIndex(vectorIndex);
     setEmbeddingProvider(mockEmbedder);
   });
