@@ -35,7 +35,7 @@ export const DECAY = {
   IMPORTANCE_MIN: 0,
 } as const;
 
-const MS_PER_DAY = 86_400_000;
+export const MS_PER_DAY = 86_400_000;
 
 // Maturity tiers as a discriminated set of string literals. Stored as a
 // plain string in LifecycleFields, but used here for clarity.

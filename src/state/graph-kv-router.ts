@@ -75,26 +75,28 @@ export async function backfillGraphIfEmpty(
   edges: number;
   history: number;
 }> {
-  const [haveNodes, haveEdges] = await Promise.all([
-    graph.list(KV.graphNodes),
-    graph.list(KV.graphEdges),
-  ]);
-  if (haveNodes.length > 0 || haveEdges.length > 0) {
-    return {
-      migrated: false,
-      nodes: haveNodes.length,
-      edges: haveEdges.length,
-      history: 0,
-    };
-  }
-
   const counts = { nodes: 0, edges: 0, history: 0 };
   const scopes: Array<[string, keyof typeof counts]> = [
     [KV.graphNodes, "nodes"],
     [KV.graphEdges, "edges"],
     [KV.graphEdgeHistory, "history"],
   ];
+
+  // Migrate each scope INDEPENDENTLY: copy a scope only if the routed backend
+  // holds none of it yet. This stays idempotent across restarts AND is robust
+  // to a migration that crashed part-way — if a prior boot copied nodes but
+  // died before edges, the next boot still sees edges empty and finishes them,
+  // instead of an all-or-nothing guard treating a populated nodes scope as
+  // "fully migrated". graph.set is itself idempotent (mergeInsert on the
+  // composite pk), so re-copying an already-present scope would also be safe;
+  // skipping it just avoids needless writes.
+  let migrated = false;
   for (const [scope, bucket] of scopes) {
+    const have = await graph.list(scope);
+    if (have.length > 0) {
+      counts[bucket] = have.length;
+      continue;
+    }
     const items = await source
       .list<{ id?: string }>(scope)
       .catch(() => [] as Array<{ id?: string }>);
@@ -102,12 +104,14 @@ export async function backfillGraphIfEmpty(
       if (item && typeof item.id === "string" && item.id.length > 0) {
         await graph.set(scope, item.id, item);
         counts[bucket]++;
+        migrated = true;
       }
     }
   }
+
   // Each set above created its own on-disk version; compact once so the freshly
   // migrated table starts tight rather than at one fragment per row.
-  await graph.optimize?.();
+  if (migrated) await graph.optimize?.();
 
-  return { migrated: true, ...counts };
+  return { migrated, ...counts };
 }

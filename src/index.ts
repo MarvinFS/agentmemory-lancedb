@@ -507,7 +507,17 @@ async function main() {
     }
   }
 
-  const needsRebuild = bm25Index.size === 0;
+  // Rebuild when BM25 is empty, OR when an embedding provider is configured
+  // but the vector index is empty while BM25 is not. The latter happens after
+  // a DROP_STALE dimension-mismatch clear() (or any path that empties the
+  // vector store while the BM25 blob survives): leaving it would strand
+  // semantic search with zero vectors and no recovery. rebuildIndex re-embeds
+  // the whole corpus (fire-and-forget below, so boot is not blocked).
+  const needsRebuild =
+    bm25Index.size === 0 ||
+    (vectorIndex !== null &&
+      embeddingProvider !== null &&
+      vectorIndex.size === 0);
 
   if (needsRebuild) {
     // Fire-and-forget. rebuildIndex iterates every observation across
@@ -658,7 +668,18 @@ async function main() {
   }
 
   if (process.env.LIFECYCLE_SWEEP_ENABLED !== "false") {
-    const lifecycleSweepIntervalMs = parseInt(process.env.LIFECYCLE_SWEEP_INTERVAL_MS || "86400000", 10);
+    const parsedSweepInterval = parseInt(
+      process.env.LIFECYCLE_SWEEP_INTERVAL_MS || "86400000",
+      10,
+    );
+    // Guard against a non-numeric override (parseInt -> NaN) or a non-positive
+    // value: setInterval(fn, NaN) coerces the delay to 0 and would spin the
+    // sweep — a full listLifecycle scan plus tier writes — on every event-loop
+    // tick. Fall back to the 24h default.
+    const lifecycleSweepIntervalMs =
+      Number.isFinite(parsedSweepInterval) && parsedSweepInterval > 0
+        ? parsedSweepInterval
+        : 86400000;
     const lifecycleSweepTimer = setInterval(async () => {
       try {
         await sdk.trigger({ function_id: "mem::lifecycle-sweep", payload: {} });

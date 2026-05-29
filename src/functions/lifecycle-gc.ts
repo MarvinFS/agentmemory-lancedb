@@ -9,10 +9,8 @@
 // Degrades gracefully: with no vector backend, or a backend that does not
 // track lifecycle (listLifecycle returns an empty Map), the result is [].
 
-import type { VectorIndex } from "../state/vector-index.js";
-import { applyDecay } from "../state/lifecycle-scoring.js";
-
-const MS_PER_DAY = 86_400_000;
+import type { VectorIndex, LifecycleFields } from "../state/vector-index.js";
+import { applyDecay, MS_PER_DAY } from "../state/lifecycle-scoring.js";
 
 // Decayed-importance floor below which a non-core record is GC-eligible.
 const IMPORTANCE_FLOOR = 35;
@@ -38,10 +36,14 @@ export interface GcCandidate {
 export async function findGcCandidates(
   vector: VectorIndex | null,
   nowMs: number,
+  // Optional preloaded lifecycle map: when the caller (the periodic sweep)
+  // has already scanned every record, reuse it instead of issuing a second
+  // full listLifecycle() table scan.
+  preloaded?: Map<string, LifecycleFields>,
 ): Promise<GcCandidate[]> {
-  if (!vector) return [];
+  if (!vector && !preloaded) return [];
 
-  const all = await vector.listLifecycle();
+  const all = preloaded ?? (await vector!.listLifecycle());
   if (all.size === 0) return [];
 
   const candidates: GcCandidate[] = [];

@@ -267,29 +267,29 @@ export class HybridSearch {
     // This MUST NOT block or break the response: we do not await it, and
     // every failure path (no backend, memory no-op, partial read) is
     // swallowed so search latency and correctness are unaffected.
-    if (this.vector && enriched.length > 0) {
+    if (this.vector && enriched.length > 0 && lifecycle.size > 0) {
       const vector = this.vector;
+      const now = Date.now();
       const reinforceIds = enriched.map((e) => e.observation.id);
-      void (async () => {
-        const now = Date.now();
-        const current = await vector.getLifecycle(reinforceIds);
-        if (current.size === 0) return; // backend without lifecycle: no-op
-        await Promise.all(
-          reinforceIds.map((id) => {
-            const f = current.get(id);
-            if (!f) return Promise.resolve();
-            // Bump importance/recency, then recompute the maturity tier so an
-            // access that pushes importance past a promote threshold takes
-            // effect immediately (demotion on decay is handled by the daily
-            // lifecycle sweep, which sees decayed importance).
-            const reinforced = reinforceOnAccess(f, now);
-            return vector.setLifecycle(id, {
-              ...reinforced,
-              maturity: nextMaturity(reinforced),
-            });
-          }),
-        );
-      })().catch(() => {
+      // Reuse the lifecycle records already fetched for the re-rank above
+      // instead of a second getLifecycle round-trip for a subset of the same
+      // ids. The map holds the raw, un-decayed records reinforceOnAccess
+      // expects (the re-rank decays a copy, never mutating the map).
+      void Promise.all(
+        reinforceIds.map((id) => {
+          const f = lifecycle.get(id);
+          if (!f) return Promise.resolve();
+          // Bump importance/recency, then recompute the maturity tier so an
+          // access that pushes importance past a promote threshold takes
+          // effect immediately (demotion on decay is handled by the daily
+          // lifecycle sweep, which sees decayed importance).
+          const reinforced = reinforceOnAccess(f, now);
+          return vector.setLifecycle(id, {
+            ...reinforced,
+            maturity: nextMaturity(reinforced),
+          });
+        }),
+      ).catch(() => {
         // best-effort: ignore all reinforcement failures
       });
     }

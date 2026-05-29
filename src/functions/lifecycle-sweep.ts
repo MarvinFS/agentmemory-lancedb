@@ -53,8 +53,9 @@ export function registerLifecycleSweepFunction(sdk: ISdk): void {
       }
     }
 
-    // 2. GC review (read-only).
-    const candidates = await findGcCandidates(vector, now);
+    // 2. GC review (read-only). Reuse the `all` map already scanned above so
+    // the sweep does ONE listLifecycle() table scan, not two.
+    const candidates = await findGcCandidates(vector, now, all);
 
     logger.info("Lifecycle sweep complete", {
       records: all.size,
