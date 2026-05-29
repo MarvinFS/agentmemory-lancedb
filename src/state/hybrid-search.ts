@@ -19,6 +19,7 @@ import { rerank } from "./reranker.js";
 import {
   applyDecay,
   compoundScore,
+  nextMaturity,
   reinforceOnAccess,
 } from "./lifecycle-scoring.js";
 import type { LifecycleFields } from "./vector-index.js";
@@ -277,7 +278,15 @@ export class HybridSearch {
           reinforceIds.map((id) => {
             const f = current.get(id);
             if (!f) return Promise.resolve();
-            return vector.setLifecycle(id, reinforceOnAccess(f, now));
+            // Bump importance/recency, then recompute the maturity tier so an
+            // access that pushes importance past a promote threshold takes
+            // effect immediately (demotion on decay is handled by the daily
+            // lifecycle sweep, which sees decayed importance).
+            const reinforced = reinforceOnAccess(f, now);
+            return vector.setLifecycle(id, {
+              ...reinforced,
+              maturity: nextMaturity(reinforced),
+            });
           }),
         );
       })().catch(() => {

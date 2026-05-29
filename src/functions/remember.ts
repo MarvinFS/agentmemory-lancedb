@@ -6,7 +6,8 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { memoryToObservation } from "../state/memory-utils.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
-import { getSearchIndex, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { getSearchIndex, getVectorIndex, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { reinforceOnUpdate, nextMaturity } from "../state/lifecycle-scoring.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 
@@ -146,6 +147,35 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           memory.title + " " + memory.content,
           { kind: "memory", logId: memory.id },
         );
+
+        // Adaptive Knowledge Lifecycle: re-saving knowledge that supersedes an
+        // existing memory is a content UPDATE - carry the prior version's
+        // accumulated lifecycle (importance/access history/createdAt) forward
+        // onto the new id, apply the update reinforcement, and recompute the
+        // maturity tier. New (non-superseding) memories keep the default
+        // lifecycle written by the vector add above. Best-effort: lifecycle is
+        // non-critical and must never block or fail the save.
+        if (supersededId) {
+          const vi = getVectorIndex();
+          if (vi) {
+            try {
+              const prior = await vi.getLifecycle([supersededId]);
+              const f = prior.get(supersededId);
+              if (f) {
+                const reinforced = reinforceOnUpdate(f, Date.now());
+                await vi.setLifecycle(memory.id, {
+                  ...reinforced,
+                  maturity: nextMaturity(reinforced),
+                });
+              }
+            } catch (err) {
+              logger.warn("Failed to carry lifecycle forward on supersede", {
+                memId: memory.id,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+        }
 
         if (supersededId) {
           await sdk.trigger({

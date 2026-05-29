@@ -52,6 +52,7 @@ import { registerFileIndexFunction } from "./functions/file-index.js";
 import { registerConsolidateFunction } from "./functions/consolidate.js";
 import { registerPatternsFunction } from "./functions/patterns.js";
 import { registerRememberFunction } from "./functions/remember.js";
+import { registerLifecycleSweepFunction } from "./functions/lifecycle-sweep.js";
 import { registerEvictFunction } from "./functions/evict.js";
 import { registerRelationsFunction } from "./functions/relations.js";
 import { registerTimelineFunction } from "./functions/timeline.js";
@@ -355,6 +356,7 @@ async function main() {
   registerRetentionFunctions(sdk, kv);
   registerCompressFileFunction(sdk, kv, provider);
   registerReplayFunctions(sdk, kv);
+  registerLifecycleSweepFunction(sdk);
   bootLog(
     `v0.6 advanced retrieval: sliding-window, query-expansion, temporal-graph, retention-scoring`,
   );
@@ -622,6 +624,17 @@ async function main() {
     }, consolidationIntervalMs);
     consolidationTimer.unref();
     bootLog(`Auto-consolidation: enabled (every ${consolidationIntervalMs / 60000}m)`);
+  }
+
+  if (process.env.LIFECYCLE_SWEEP_ENABLED !== "false") {
+    const lifecycleSweepIntervalMs = parseInt(process.env.LIFECYCLE_SWEEP_INTERVAL_MS || "86400000", 10);
+    const lifecycleSweepTimer = setInterval(async () => {
+      try {
+        await sdk.trigger({ function_id: "mem::lifecycle-sweep", payload: {} });
+      } catch {}
+    }, lifecycleSweepIntervalMs);
+    lifecycleSweepTimer.unref();
+    bootLog(`Lifecycle sweep: enabled (maturity demotion + GC review, every ${lifecycleSweepIntervalMs / 3600000}h)`);
   }
 
   const shutdown = async () => {
