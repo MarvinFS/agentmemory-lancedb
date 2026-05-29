@@ -126,9 +126,10 @@ Pure functions in `src/state/lifecycle-scoring.ts`:
 
 ## Build / packaging
 
-`@lancedb/lancedb@^0.30.0` + `apache-arrow@^21.1.0` added to `optionalDependencies` and to
-`tsdown.config.ts` `external[]` (native `.node` binaries must not be bundled - same treatment as
-onnxruntime). Lazy-loaded only when the lancedb backend is active.
+`@lancedb/lancedb@^0.30.0` + `apache-arrow@18.1.0` (pinned to LanceDB 0.30's peer ceiling
+`>=15.0.0 <=18.1.0`) added to `optionalDependencies` and to `tsdown.config.ts` `external[]` (native
+`.node` binaries must not be bundled - same treatment as onnxruntime). Lazy-loaded only when the
+lancedb backend is active.
 
 ## Cutover (hard, after validation gate)
 
