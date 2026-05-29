@@ -83,6 +83,7 @@ export interface VectorBackend {
   readonly persistsExternally: boolean;
   // Adaptive Knowledge Lifecycle (optional; no-op when unsupported).
   getLifecycle?(obsIds: string[]): Promise<Map<string, LifecycleFields>>;
+  listLifecycle?(): Promise<Map<string, LifecycleFields>>;
   bumpAccess?(obsIds: string[]): Promise<void>;
   setLifecycle?(obsId: string, fields: Partial<LifecycleFields>): Promise<void>;
 }
@@ -135,6 +136,10 @@ export class VectorIndex {
 
   getLifecycle(obsIds: string[]): Promise<Map<string, LifecycleFields>> {
     return this.backend.getLifecycle?.(obsIds) ?? Promise.resolve(new Map());
+  }
+
+  listLifecycle(): Promise<Map<string, LifecycleFields>> {
+    return this.backend.listLifecycle?.() ?? Promise.resolve(new Map());
   }
 
   bumpAccess(obsIds: string[]): Promise<void> {
