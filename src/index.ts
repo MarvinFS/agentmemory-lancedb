@@ -542,6 +542,23 @@ async function main() {
     }
   }
 
+  // Periodic LanceDB compaction. Live writes each create a new on-disk
+  // version; without periodic compaction the index accrues unbounded
+  // fragments. Hourly optimize()+prune keeps it tight. No-op for the
+  // in-memory backend; unref so it never holds the process open at exit.
+  if (vectorIndex) {
+    const vi = vectorIndex;
+    const optimizeTimer = setInterval(
+      () => {
+        vi.optimize().catch((err) => {
+          console.warn(`[agentmemory] vector index optimize failed:`, err);
+        });
+      },
+      60 * 60 * 1000,
+    );
+    optimizeTimer.unref?.();
+  }
+
   // Ready / Endpoints lines are emitted via `bootLog` so they're
   // buffered in quiet mode and printed verbatim under --verbose. The
   // CLI surfaces a compact summary when it sees the worker reach

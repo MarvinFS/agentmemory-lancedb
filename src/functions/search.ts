@@ -3,7 +3,7 @@ import type { CompactSearchResult, CompressedObservation, Memory, SearchResult, 
 import { KV } from '../state/schema.js'
 import { StateKV } from '../state/kv.js'
 import { SearchIndex } from '../state/search-index.js'
-import { VectorIndex } from '../state/vector-index.js'
+import { VectorIndex, type VectorAddItem } from '../state/vector-index.js'
 import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation } from '../state/memory-utils.js'
 import { recordAccessBatch } from './access-tracker.js'
@@ -170,7 +170,7 @@ export async function vectorIndexAddBatchGuarded(
     return { ok: 0, fail: items.length }
   }
 
-  let ok = 0
+  const valid: VectorAddItem[] = []
   let fail = 0
   for (let i = 0; i < items.length; i++) {
     const item = items[i]
@@ -186,19 +186,22 @@ export async function vectorIndexAddBatchGuarded(
       fail++
       continue
     }
-    try {
-      await vi.add(item.id, item.sessionId, embedding)
-      ok++
-    } catch (err) {
-      logger.warn("vector-index add batch: index write failed — skipping item", {
-        kind: item.context.kind,
-        id: item.context.logId,
-        error: err instanceof Error ? err.message : String(err),
-      })
-      fail++
-    }
+    valid.push({ obsId: item.id, sessionId: item.sessionId, embedding })
   }
-  return { ok, fail }
+  // One bulk commit per batch instead of a per-vector write. For a
+  // self-persisting backend (lancedb) this is the difference between one
+  // on-disk version per batch and one per vector (thousands of fragments on a
+  // full-corpus rebuild). rebuildIndex clear()s first, so these are all new ids.
+  try {
+    await vi.bulkAdd(valid)
+    return { ok: valid.length, fail }
+  } catch (err) {
+    logger.warn("vector-index add batch: bulk index write failed — skipping batch", {
+      batchSize: valid.length,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return { ok: 0, fail: fail + valid.length }
+  }
 }
 
 // Embed-batch size for rebuild. Each item is one /v1/embeddings call's
@@ -315,6 +318,10 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
 
   // Drain the last partial batch.
   await flush()
+  // Compact the freshly bulk-loaded index and prune the versions created
+  // during this rebuild, so a full re-embed doesn't leave fragment bloat
+  // behind. No-op for the in-memory backend.
+  await vectorIndex?.optimize()
   return count
 }
 

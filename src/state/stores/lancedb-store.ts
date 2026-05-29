@@ -6,6 +6,7 @@ import {
   VectorIndex,
   type VectorBackend,
   type VectorSearchHit,
+  type VectorAddItem,
   type DimensionReport,
   type LifecycleFields,
 } from "../vector-index.js";
@@ -58,6 +59,8 @@ interface LanceQuery {
 
 interface LanceTable {
   countRows(filter?: string): Promise<number>;
+  add(data: Array<Record<string, unknown>>): Promise<unknown>;
+  optimize(options?: { cleanupOlderThan?: Date }): Promise<unknown>;
   update(opts: {
     where?: string;
     values: Record<string, unknown>;
@@ -261,6 +264,32 @@ class LanceVectorBackend implements VectorBackend {
     this._count += 1;
   }
 
+  // Bulk insert for the rebuild/backfill path. rebuildIndex clear()s the table
+  // first, so every row is new and a single table.add() of the whole batch is
+  // ONE on-disk commit — vs the per-row add() above, which writes a Lance
+  // version per vector (fine for occasional live writes, but on a full-corpus
+  // rebuild that means thousands of fragments + an O(n) existence check each).
+  // Assumes new ids (no upsert); the caller guarantees a prior clear().
+  async bulkAdd(items: VectorAddItem[]): Promise<void> {
+    if (items.length === 0) return;
+    const table = this.requireTable();
+    const now = Date.now();
+    const rows = items.map((it) => ({
+      id: it.obsId,
+      session_id: it.sessionId,
+      vector: Array.from(it.embedding),
+      importance: DEFAULT_IMPORTANCE,
+      recency: DEFAULT_RECENCY,
+      access_count: 0,
+      update_count: 0,
+      maturity: DEFAULT_MATURITY,
+      created_at: now,
+      updated_at: now,
+    }));
+    await table.add(rows);
+    this._count += rows.length;
+  }
+
   async remove(obsId: string): Promise<void> {
     const table = this.requireTable();
     await table.delete(`id = ${sqlString(obsId)}`);
@@ -319,6 +348,16 @@ class LanceVectorBackend implements VectorBackend {
       this.buildSchema(),
     );
     this._count = 0;
+  }
+
+  // Compact small fragments and prune superseded versions. Per-row add() and
+  // the live write stream each create a new Lance version; without periodic
+  // compaction the table's file count and on-disk size grow unbounded. We keep
+  // no index version history (external tar backups cover recovery), so prune
+  // everything older than now.
+  async optimize(): Promise<void> {
+    const table = this.requireTable();
+    await table.optimize({ cleanupOlderThan: new Date() });
   }
 
   async validateDimensions(expected: number): Promise<DimensionReport> {

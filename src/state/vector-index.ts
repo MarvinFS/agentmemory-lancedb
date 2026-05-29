@@ -40,6 +40,12 @@ export interface VectorSearchHit {
   score: number;
 }
 
+export interface VectorAddItem {
+  obsId: string;
+  sessionId: string;
+  embedding: Float32Array;
+}
+
 export interface DimensionReport {
   mismatches: Array<{ obsId: string; dim: number }>;
   seenDimensions: Set<number>;
@@ -73,6 +79,11 @@ export interface LifecycleFields {
 export interface VectorBackend {
   init?(): Promise<void>;
   add(obsId: string, sessionId: string, embedding: Float32Array): Promise<void>;
+  // Bulk insert assuming new ids (used by rebuild after clear()). Optional;
+  // the wrapper falls back to sequential add() when a backend omits it. A
+  // self-persisting backend implements this as one disk commit per batch
+  // instead of one per vector.
+  bulkAdd?(items: VectorAddItem[]): Promise<void>;
   remove(obsId: string): Promise<void>;
   search(query: Float32Array, limit?: number): Promise<VectorSearchHit[]>;
   readonly size: number;
@@ -86,6 +97,9 @@ export interface VectorBackend {
   listLifecycle?(): Promise<Map<string, LifecycleFields>>;
   bumpAccess?(obsIds: string[]): Promise<void>;
   setLifecycle?(obsId: string, fields: Partial<LifecycleFields>): Promise<void>;
+  // Compact on-disk storage and prune superseded versions. No-op for the
+  // in-memory backend; self-persisting backends implement real compaction.
+  optimize?(): Promise<void>;
 }
 
 // Thin wrapper consumers hold. Delegates to a swappable backend and
@@ -100,6 +114,21 @@ export class VectorIndex {
     embedding: Float32Array,
   ): Promise<void> {
     return this.backend.add(obsId, sessionId, embedding);
+  }
+
+  bulkAdd(items: VectorAddItem[]): Promise<void> {
+    if (this.backend.bulkAdd) return this.backend.bulkAdd(items);
+    return this.sequentialAdd(items);
+  }
+
+  private async sequentialAdd(items: VectorAddItem[]): Promise<void> {
+    for (const it of items) {
+      await this.backend.add(it.obsId, it.sessionId, it.embedding);
+    }
+  }
+
+  optimize(): Promise<void> {
+    return this.backend.optimize?.() ?? Promise.resolve();
   }
 
   remove(obsId: string): Promise<void> {
@@ -168,6 +197,15 @@ export class MemoryVectorIndex implements VectorBackend {
     embedding: Float32Array,
   ): Promise<void> {
     this.vectors.set(obsId, { embedding, sessionId });
+  }
+
+  async bulkAdd(items: VectorAddItem[]): Promise<void> {
+    for (const it of items) {
+      this.vectors.set(it.obsId, {
+        embedding: it.embedding,
+        sessionId: it.sessionId,
+      });
+    }
   }
 
   async remove(obsId: string): Promise<void> {
