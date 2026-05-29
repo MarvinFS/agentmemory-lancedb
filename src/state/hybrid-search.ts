@@ -16,6 +16,12 @@ import {
 } from "../functions/graph-retrieval.js";
 import { extractEntitiesFromQuery } from "../functions/query-expansion.js";
 import { rerank } from "./reranker.js";
+import {
+  applyDecay,
+  compoundScore,
+  reinforceOnAccess,
+} from "./lifecycle-scoring.js";
+import type { LifecycleFields } from "./vector-index.js";
 
 const RRF_K = 60;
 
@@ -218,12 +224,66 @@ export class HybridSearch {
         effectiveGraphW * (1 / (RRF_K + s.graphRank)),
     }));
 
+    // --- Adaptive Knowledge Lifecycle re-rank (optional, graceful) ---
+    // Blend the RRF combinedScore with per-observation lifecycle signal
+    // (importance/recency/maturity). If the backend has no lifecycle data
+    // (in-memory backend, or LanceDB with no rows scored yet), getLifecycle
+    // returns an empty Map and we skip the re-rank entirely so ranking is
+    // bit-for-bit identical to the pre-lifecycle behavior.
+    const lifecycle: Map<string, LifecycleFields> = this.vector
+      ? await this.vector.getLifecycle(combined.map((c) => c.obsId))
+      : new Map();
+    if (lifecycle.size > 0) {
+      const now = Date.now();
+      const maxCombined = combined.reduce(
+        (m, c) => (c.combinedScore > m ? c.combinedScore : m),
+        0,
+      );
+      if (maxCombined > 0) {
+        for (const c of combined) {
+          const rrfNorm = c.combinedScore / maxCombined;
+          const f = lifecycle.get(c.obsId);
+          // Decay only when a record exists; compoundScore with undefined
+          // returns rrfNorm unchanged (the no-lifecycle fallback).
+          c.combinedScore = compoundScore(
+            rrfNorm,
+            f ? applyDecay(f, now) : undefined,
+          );
+        }
+      }
+    }
+
     combined.sort((a, b) => b.combinedScore - a.combinedScore);
 
     const retrievalDepth = Math.max(limit, 20);
     const rerankWindow = 20;
     const diversified = this.diversifyBySession(combined, retrievalDepth);
     const enriched = await this.enrichResults(diversified, retrievalDepth);
+
+    // --- Best-effort access reinforcement (fire-and-forget) ---
+    // Bump the lifecycle of the observations we are about to return so
+    // frequently-recalled knowledge gains importance and resets recency.
+    // This MUST NOT block or break the response: we do not await it, and
+    // every failure path (no backend, memory no-op, partial read) is
+    // swallowed so search latency and correctness are unaffected.
+    if (this.vector && enriched.length > 0) {
+      const vector = this.vector;
+      const reinforceIds = enriched.map((e) => e.observation.id);
+      void (async () => {
+        const now = Date.now();
+        const current = await vector.getLifecycle(reinforceIds);
+        if (current.size === 0) return; // backend without lifecycle: no-op
+        await Promise.all(
+          reinforceIds.map((id) => {
+            const f = current.get(id);
+            if (!f) return Promise.resolve();
+            return vector.setLifecycle(id, reinforceOnAccess(f, now));
+          }),
+        );
+      })().catch(() => {
+        // best-effort: ignore all reinforcement failures
+      });
+    }
 
     if (this.rerankEnabled && enriched.length > 1) {
       try {
