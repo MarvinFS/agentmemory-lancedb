@@ -187,7 +187,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         }
         await deleteAccessLog(kv, data.memoryId);
         getSearchIndex().remove(data.memoryId);
-        vectorIndexRemove(data.memoryId);
+        await vectorIndexRemove(data.memoryId);
         deletedMemoryIds.push(data.memoryId);
         deleted++;
       }
@@ -208,7 +208,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             await decrementImageRef(kv, sdk, obs.imageRef);
           }
           getSearchIndex().remove(obsId);
-          vectorIndexRemove(obsId);
+          await vectorIndexRemove(obsId);
           deletedObservationIds.push(obsId);
           deleted++;
         }
@@ -229,7 +229,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             await decrementImageRef(kv, sdk, obs.imageRef);
           }
           getSearchIndex().remove(obs.id);
-          vectorIndexRemove(obs.id);
+          await vectorIndexRemove(obs.id);
           deletedObservationIds.push(obs.id);
           deleted++;
         }

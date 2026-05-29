@@ -55,7 +55,7 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
               });
               await deleteAccessLog(kv, mem.id);
               getSearchIndex().remove(mem.id);
-              vectorIndexRemove(mem.id);
+              await vectorIndexRemove(mem.id);
             }
           }
         }
@@ -183,7 +183,7 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
                   timestamp: obs.timestamp,
                 });
                 getSearchIndex().remove(obs.id);
-                vectorIndexRemove(obs.id);
+                await vectorIndexRemove(obs.id);
               }
             }
           }

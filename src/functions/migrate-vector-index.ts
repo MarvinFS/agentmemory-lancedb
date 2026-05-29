@@ -1,5 +1,5 @@
 import type { EmbeddingProvider, CompressedObservation, Memory } from "../types.js";
-import { VectorIndex } from "../state/vector-index.js";
+import { VectorIndex, MemoryVectorIndex } from "../state/vector-index.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
@@ -45,7 +45,10 @@ export async function migrateVectorIndex(
   kv: StateKV,
   newProvider: EmbeddingProvider,
 ): Promise<MigrateVectorIndexResult> {
-  const newIndex = new VectorIndex();
+  // A throwaway in-memory index: this path only re-embeds + counts to
+  // validate a provider swap; it never persists, so the backend choice is
+  // irrelevant and MemoryVectorIndex avoids touching LanceDB.
+  const newIndex = new VectorIndex(new MemoryVectorIndex());
   let failed = 0;
   let processed = 0;
   const failedSessions: string[] = [];
@@ -69,7 +72,7 @@ export async function migrateVectorIndex(
           failed++;
           continue;
         }
-        newIndex.add(
+        await newIndex.add(
           textMems[i].id,
           textMems[i].sessionIds[0] ?? "memory",
           embeddings[i],
@@ -129,7 +132,7 @@ export async function migrateVectorIndex(
           failed++;
           continue;
         }
-        newIndex.add(textObs[i].id, textObs[i].sessionId, embeddings[i]);
+        await newIndex.add(textObs[i].id, textObs[i].sessionId, embeddings[i]);
         processed++;
       }
     } catch (err) {

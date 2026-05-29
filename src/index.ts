@@ -12,6 +12,7 @@ import {
   isConsolidationEnabled,
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
+  getVectorBackendKind,
 } from "./config.js";
 import {
   createProvider,
@@ -22,6 +23,11 @@ import {
 import { StateKV } from "./state/kv.js";
 import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
+import { createPersistenceBackends } from "./state/vector-store.js";
+import {
+  KvIndexBlobStore,
+  type IndexBlobStore,
+} from "./state/index-blob-store.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
@@ -220,7 +226,25 @@ async function main() {
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
-  const vectorIndex = embeddingProvider ? new VectorIndex() : null;
+  // Vector + BM25 persistence backends. With an embedding provider the
+  // selected VECTOR_BACKEND owns the vector index (and, for lancedb, the
+  // BM25 blob too); without one there are no vectors and BM25 stays in the
+  // iii KV. createPersistenceBackends opens lancedb's table and caches its
+  // row count before returning, so VectorIndex.size is valid at boot below.
+  let vectorIndex: VectorIndex | null = null;
+  let indexBlobStore: IndexBlobStore;
+  if (embeddingProvider) {
+    const backends = await createPersistenceBackends({
+      kv,
+      dataDir: config.dataDir,
+      dimensions: embeddingProvider.dimensions,
+      backend: getVectorBackendKind(),
+    });
+    vectorIndex = backends.vector;
+    indexBlobStore = backends.blobStore;
+  } else {
+    indexBlobStore = new KvIndexBlobStore(kv);
+  }
 
   setVectorIndex(vectorIndex);
   setEmbeddingProvider(embeddingProvider);
@@ -373,7 +397,11 @@ async function main() {
 
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
-  const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex);
+  const indexPersistence = new IndexPersistence(
+    indexBlobStore,
+    bm25Index,
+    vectorIndex,
+  );
   // Wire the persistence hook so delete paths can flush BM25/vector
   // index mutations to disk. Without this, an in-memory remove can be
   // lost across a hard process exit and the persisted snapshot
@@ -390,7 +418,13 @@ async function main() {
       `Loaded persisted BM25 index (${bm25Index.size} docs)`,
     );
   }
-  if (loaded?.vector && vectorIndex && loaded.vector.size > 0) {
+  // Restore in-memory vectors from the blob (no-op for self-persisting
+  // backends like lancedb, which already opened their data from disk at
+  // construction; their vectorJson is null).
+  if (loaded?.vectorJson && vectorIndex) {
+    await vectorIndex.restoreFrom(loaded.vectorJson);
+  }
+  if (vectorIndex && vectorIndex.size > 0) {
     // Persisted vectors carry whatever dimension the provider had when
     // they were written. If the active provider declares a different
     // dimension — or if the on-disk index contains a mix of dimensions
@@ -403,7 +437,7 @@ async function main() {
     const activeDim = embeddingProvider?.dimensions ?? 0;
     const { mismatches, seenDimensions } =
       activeDim > 0
-        ? loaded.vector.validateDimensions(activeDim)
+        ? await vectorIndex.validateDimensions(activeDim)
         : { mismatches: [], seenDimensions: new Set<number>() };
 
     if (mismatches.length > 0) {
@@ -416,16 +450,17 @@ async function main() {
       if (dropStale) {
         console.warn(
           `[agentmemory] Persisted vector index has ${mismatches.length} of ` +
-            `${loaded.vector.size} vectors with the wrong dimension. Active ` +
+            `${vectorIndex.size} vectors with the wrong dimension. Active ` +
             `provider (${embeddingProvider?.name}) declares ${activeDim}; ` +
             `dimensions seen on disk: ${distinct}. ` +
             `AGENTMEMORY_DROP_STALE_INDEX=true is set — discarding the persisted ` +
             `vectors. Live observations will rebuild the index over time.`,
         );
+        await vectorIndex.clear();
       } else {
         throw new Error(
           `[agentmemory] Refusing to start: persisted vector index has ` +
-            `${mismatches.length} of ${loaded.vector.size} vectors with the ` +
+            `${mismatches.length} of ${vectorIndex.size} vectors with the ` +
             `wrong dimension. Active provider (${embeddingProvider?.name}) ` +
             `declares ${activeDim}; dimensions seen on disk: ${distinct}. ` +
             `First mismatched obsIds: ${sample}. Loading would silently corrupt ` +
@@ -437,7 +472,6 @@ async function main() {
         );
       }
     } else {
-      vectorIndex.restoreFrom(loaded.vector);
       bootLog(
         `Loaded persisted vector index (${vectorIndex.size} vectors)`,
       );

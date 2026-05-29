@@ -25,7 +25,7 @@ export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
           await kv.delete(KV.memories, id);
           await deleteAccessLog(kv, id);
           getSearchIndex().remove(id);
-          vectorIndexRemove(id);
+          await vectorIndexRemove(id);
           deleted++;
         }
       }
@@ -113,7 +113,7 @@ export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
             await kv.delete(KV.memories, mem.id);
             await deleteAccessLog(kv, mem.id);
             getSearchIndex().remove(mem.id);
-            vectorIndexRemove(mem.id);
+            await vectorIndexRemove(mem.id);
           }),
         );
         results.forEach((result, j) => {

@@ -34,8 +34,8 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
   return currentEmbeddingProvider
 }
 
-export function vectorIndexRemove(id: string): void {
-  vectorIndex?.remove(id);
+export async function vectorIndexRemove(id: string): Promise<void> {
+  await vectorIndex?.remove(id);
 }
 
 // Persistence sync hook. Without this, index removals only live in
@@ -111,7 +111,7 @@ export async function vectorIndexAddGuarded(
       })
       return false
     }
-    vi.add(id, sessionId, embedding)
+    await vi.add(id, sessionId, embedding)
     return true
   } catch (err) {
     logger.warn("vector-index add: embed failed — skipping", {
@@ -187,7 +187,7 @@ export async function vectorIndexAddBatchGuarded(
       continue
     }
     try {
-      vi.add(item.id, item.sessionId, embedding)
+      await vi.add(item.id, item.sessionId, embedding)
       ok++
     } catch (err) {
       logger.warn("vector-index add batch: index write failed — skipping item", {
@@ -225,7 +225,7 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
   // symmetric concern — memories/observations deleted between runs
   // would leave orphan embeddings here forever. Clear both before the
   // repopulation loops run, so BM25 and vector stay in sync.
-  vectorIndex?.clear()
+  await vectorIndex?.clear()
 
   const batchSize = getRebuildEmbedBatchSize()
   // Accumulator for the batched embed flush. BM25 add is synchronous and
