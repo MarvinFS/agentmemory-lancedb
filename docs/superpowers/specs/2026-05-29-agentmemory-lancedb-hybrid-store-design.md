@@ -135,7 +135,7 @@ lancedb backend is active.
 
 Flag-validate on the VM, then hard cutover: lancedb becomes the default, the chunk-persist patch is
 removed from `agentmemory-autoupdate.sh`, and the stale `mem:index:bm25` keys are deleted. Pre-cutover
-backup of `/home/marvinfs/data/` is the rollback.
+backup of the data directory (`~/data/`) is the rollback.
 
 ## Verification
 
