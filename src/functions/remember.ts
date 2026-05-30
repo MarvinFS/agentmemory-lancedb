@@ -7,6 +7,7 @@ import { memoryToObservation } from "../state/memory-utils.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
 import { getSearchIndex, getVectorIndex, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { deleteObservationCascade } from "./_observation-cascade.js";
 import { reinforceOnUpdate, nextMaturity } from "../state/lifecycle-scoring.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
@@ -233,12 +234,14 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             obsId,
           );
           await kv.delete(KV.observations(data.sessionId), obsId);
-          if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs?.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
-          }
-          getSearchIndex().remove(obsId);
-          await vectorIndexRemove(obsId);
+          // No per-id audit here: mem::forget emits one batched audit row
+          // across all deleted ids at the end of the call.
+          await deleteObservationCascade(kv, sdk, {
+            obsId,
+            imageData: obs?.imageData,
+            imageRef: obs?.imageRef,
+            removeFromIndex: true,
+          });
           deletedObservationIds.push(obsId);
           deleted++;
         }
@@ -254,12 +257,14 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         );
         for (const obs of observations) {
           await kv.delete(KV.observations(data.sessionId), obs.id);
-          if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
-          }
-          getSearchIndex().remove(obs.id);
-          await vectorIndexRemove(obs.id);
+          // No per-id audit here: mem::forget emits one batched audit row
+          // across all deleted ids at the end of the call.
+          await deleteObservationCascade(kv, sdk, {
+            obsId: obs.id,
+            imageData: obs.imageData,
+            imageRef: obs.imageRef,
+            removeFromIndex: true,
+          });
           deletedObservationIds.push(obs.id);
           deleted++;
         }

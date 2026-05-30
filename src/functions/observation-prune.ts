@@ -6,8 +6,8 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import { recordAudit } from "./audit.js";
-import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { flushIndexSave, vectorIndexOptimize } from "./search.js";
+import { deleteObservationCascade } from "./_observation-cascade.js";
 import { BREADCRUMB_TYPES } from "./compress-synthetic.js";
 import { logger } from "../logger.js";
 
@@ -44,7 +44,6 @@ export function registerObservationPruneFunction(
     "mem::observations-prune",
     async (data: ObservationPruneInput): Promise<ObservationPruneResult> => {
       const dryRun = data?.dryRun ?? false;
-      const { decrementImageRef } = await import("./image-refs.js");
 
       const typeSet = new Set<ObservationType>(
         data?.types && data.types.length > 0 ? data.types : DEFAULT_PRUNE_TYPES,
@@ -89,18 +88,22 @@ export function registerObservationPruneFunction(
           // unprocessed). count/byType only advance on a fully-applied delete.
           try {
             await kv.delete(KV.observations(session.id), o.id);
-            getSearchIndex().remove(o.id);
-            await vectorIndexRemove(o.id);
-            if (o.imageData) await decrementImageRef(kv, sdk, o.imageData);
-            if (o.imageRef && o.imageRef !== o.imageData) {
-              await decrementImageRef(kv, sdk, o.imageRef);
-            }
-            await recordAudit(kv, "delete", "mem::observations-prune", [o.id], {
-              resource: "observation",
-              reason: "observation_prune",
-              type: o.type,
-              sessionId: session.id,
-              dryRun,
+            await deleteObservationCascade(kv, sdk, {
+              obsId: o.id,
+              imageData: o.imageData,
+              imageRef: o.imageRef,
+              removeFromIndex: true,
+              audit: {
+                operation: "delete",
+                functionId: "mem::observations-prune",
+                details: {
+                  resource: "observation",
+                  reason: "observation_prune",
+                  type: o.type,
+                  sessionId: session.id,
+                  dryRun,
+                },
+              },
             });
           } catch (err) {
             logger.warn("Observation prune delete failed", {
@@ -118,6 +121,17 @@ export function registerObservationPruneFunction(
 
       if (!dryRun && count > 0) {
         await flushIndexSave();
+        // Each per-id vectorIndexRemove above created a new Lance version;
+        // compact them in one shot after the sweep, never per-id. Guarded +
+        // best-effort: a compaction failure must not fail the prune. No-op on
+        // non-LanceDB backends.
+        try {
+          await vectorIndexOptimize();
+        } catch (err) {
+          logger.warn("Vector index optimize after prune failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
 
       logger.info("Observation prune complete", {

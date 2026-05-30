@@ -4,7 +4,8 @@ import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
-import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { getSearchIndex, vectorIndexRemove, flushIndexSave, vectorIndexOptimize } from "./search.js";
+import { deleteObservationCascade } from "./_observation-cascade.js";
 import { logger } from "../logger.js";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -161,6 +162,7 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
         for (const obs of obsPerSession[i]) {
           if (!obs.timestamp) continue;
           const age = now - new Date(obs.timestamp).getTime();
+          // The `?? 5` default means an observation written WITHOUT an importance field is never pruned here (5 > 2) - harmless today since synthetic breadcrumbs always set importance, but a latent trap for externally-written observations.
           if (age > 180 * MS_PER_DAY && (obs.importance ?? 5) <= 2) {
             result.lowValueObs.push(obs.id);
             if (!dryRun) {
@@ -172,18 +174,22 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
                 deletedOk = false;
               }
               if (deletedOk) {
-                if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-                if (obs.imageRef && obs.imageRef !== obs.imageData) {
-                  await decrementImageRef(kv, sdk, obs.imageRef);
-                }
-                await recordAudit(kv, "delete", "mem::auto-forget", [obs.id], {
-                  resource: "observation",
-                  reason: "auto-forget low-value observation",
-                  sessionId: sessions[i].id,
-                  timestamp: obs.timestamp,
+                await deleteObservationCascade(kv, sdk, {
+                  obsId: obs.id,
+                  imageData: obs.imageData,
+                  imageRef: obs.imageRef,
+                  removeFromIndex: true,
+                  audit: {
+                    operation: "delete",
+                    functionId: "mem::auto-forget",
+                    details: {
+                      resource: "observation",
+                      reason: "auto-forget low-value observation",
+                      sessionId: sessions[i].id,
+                      timestamp: obs.timestamp,
+                    },
+                  },
                 });
-                getSearchIndex().remove(obs.id);
-                await vectorIndexRemove(obs.id);
               }
             }
           }
@@ -192,6 +198,17 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
 
       if (!dryRun && (result.ttlExpired.length > 0 || result.lowValueObs.length > 0)) {
         await flushIndexSave();
+        // Each per-id vectorIndexRemove above (TTL memories + low-value obs)
+        // created a new Lance version; compact them once after the sweep,
+        // never per-id. Guarded + best-effort: a compaction failure must not
+        // fail auto-forget. No-op on non-LanceDB backends.
+        try {
+          await vectorIndexOptimize();
+        } catch (err) {
+          logger.warn("Vector index optimize after auto-forget failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
 
       logger.info("Auto-forget complete", {

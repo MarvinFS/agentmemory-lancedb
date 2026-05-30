@@ -38,6 +38,18 @@ export async function vectorIndexRemove(id: string): Promise<void> {
   await vectorIndex?.remove(id);
 }
 
+// Compact the vector table and prune the versions/fragments created by a
+// bulk-delete loop. Call ONCE after such a loop, never per-id: each per-id
+// vectorIndexRemove creates a new Lance version, so a sweep of N deletes
+// leaves N fragments behind until this runs. Capability-guarded end to end —
+// VectorIndex.optimize() delegates to backend.optimize?.() and resolves to a
+// no-op for backends that don't implement it (the in-memory backend), so this
+// never throws on a non-LanceDB store. Callers still wrap it in try/catch:
+// a compaction failure must never fail the prune that triggered it.
+export async function vectorIndexOptimize(): Promise<void> {
+  await vectorIndex?.optimize();
+}
+
 // Persistence sync hook. Without this, index removals only live in
 // memory; a crash/SIGKILL before graceful shutdown reloads a stale
 // snapshot at boot and the deleted entry resurrects in the index.

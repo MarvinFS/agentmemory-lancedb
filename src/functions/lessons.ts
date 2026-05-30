@@ -55,13 +55,34 @@ function lessonTokenSet(text: string): Set<string> {
   );
 }
 
+// Memoize each lesson's token Set keyed on `${id}:${updatedAt}`. lexicalLessonScore
+// runs for every in-scope lesson on every recall and otherwise rebuilds the Set
+// from scratch each time; the key invalidates automatically whenever a lesson
+// changes (reinforce, decay, and context edits all bump updatedAt, the only
+// fields lessonText reads). We store a single key per lesson id — inserting a new
+// updatedAt deletes the prior key — so the cache stays O(number of lessons).
+const lessonTokenCache = new Map<string, Set<string>>();
+const lessonTokenKeyById = new Map<string, string>();
+
+function cachedLessonTokenSet(lesson: Lesson): Set<string> {
+  const key = `${lesson.id}:${lesson.updatedAt}`;
+  const cached = lessonTokenCache.get(key);
+  if (cached) return cached;
+  const tokens = lessonTokenSet(lessonText(lesson));
+  const prevKey = lessonTokenKeyById.get(lesson.id);
+  if (prevKey && prevKey !== key) lessonTokenCache.delete(prevKey);
+  lessonTokenCache.set(key, tokens);
+  lessonTokenKeyById.set(lesson.id, key);
+  return tokens;
+}
+
 // Lexical relevance of one lesson to a set of query terms, in [0, confidence].
 // confidence * (matchedTerms / totalTerms) * recencyBoost — identical shape to
 // the original scorer, but term matching is now whole-token (word-boundary)
 // and stopword-free. Returns 0 when nothing content-bearing matches.
 function lexicalLessonScore(lesson: Lesson, terms: string[]): number {
   if (terms.length === 0) return 0;
-  const tokens = lessonTokenSet(lessonText(lesson));
+  const tokens = cachedLessonTokenSet(lesson);
   const matchCount = terms.filter((t) => tokens.has(t)).length;
   if (matchCount === 0) return 0;
   const relevance = matchCount / terms.length;

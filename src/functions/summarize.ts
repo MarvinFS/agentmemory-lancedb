@@ -377,6 +377,15 @@ function sanitizeTagText(s: string): string {
   return s.replace(/</g, "＜").replace(/>/g, "＞");
 }
 
+// Inverse of sanitizeTagText: restore the fullwidth lookalikes back to literal
+// angle brackets when reading tag text back out of the synthetic XML, so a
+// serialize -> parse round-trip is lossless (e.g. "Vec<T>" survives intact).
+// Applied only to parsed tag text; the substituted characters are introduced
+// exclusively by serializeSummaryXml, so this never alters genuine LLM output.
+function desanitizeTagText(s: string): string {
+  return s.replace(/＜/g, "<").replace(/＞/g, ">");
+}
+
 // Serialize a SessionSummary back into the exact <summary> XML shape the
 // prompts ask for, so a synthetically-built summary flows through the caller's
 // unchanged parse/validate/persist path.
@@ -491,11 +500,11 @@ function parseSummaryXml(
     sessionId,
     project,
     createdAt: new Date().toISOString(),
-    title,
-    narrative,
-    keyDecisions,
-    filesModified,
-    concepts,
+    title: desanitizeTagText(title),
+    narrative: desanitizeTagText(narrative),
+    keyDecisions: keyDecisions.map(desanitizeTagText),
+    filesModified: filesModified.map(desanitizeTagText),
+    concepts: concepts.map(desanitizeTagText),
     observationCount: obsCount,
   };
 }
