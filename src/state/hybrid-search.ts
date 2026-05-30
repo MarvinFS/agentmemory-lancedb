@@ -16,6 +16,14 @@ import {
 } from "../functions/graph-retrieval.js";
 import { extractEntitiesFromQuery } from "../functions/query-expansion.js";
 import { rerank } from "./reranker.js";
+import { isBreadcrumbType } from "../functions/compress-synthetic.js";
+import {
+  applyDecay,
+  compoundScore,
+  nextMaturity,
+  reinforceOnAccess,
+} from "./lifecycle-scoring.js";
+import type { LifecycleFields } from "./vector-index.js";
 
 const RRF_K = 60;
 
@@ -91,7 +99,7 @@ export class HybridSearch {
     if (this.vector && this.embeddingProvider && this.vector.size > 0) {
       try {
         queryEmbedding = await this.embeddingProvider.embed(query);
-        vectorResults = this.vector.search(queryEmbedding, limit * 2);
+        vectorResults = await this.vector.search(queryEmbedding, limit * 2);
       } catch {
         // fall through to BM25-only
       }
@@ -218,12 +226,83 @@ export class HybridSearch {
         effectiveGraphW * (1 / (RRF_K + s.graphRank)),
     }));
 
+    // --- Adaptive Knowledge Lifecycle re-rank (optional, graceful) ---
+    // Blend the RRF combinedScore with per-observation lifecycle signal
+    // (importance/recency/maturity). If the backend has no lifecycle data
+    // (in-memory backend, or LanceDB with no rows scored yet), getLifecycle
+    // returns an empty Map and we skip the re-rank entirely so ranking is
+    // bit-for-bit identical to the pre-lifecycle behavior.
+    const lifecycle: Map<string, LifecycleFields> = this.vector
+      ? await this.vector.getLifecycle(combined.map((c) => c.obsId))
+      : new Map();
+    if (lifecycle.size > 0) {
+      const now = Date.now();
+      const maxCombined = combined.reduce(
+        (m, c) => (c.combinedScore > m ? c.combinedScore : m),
+        0,
+      );
+      if (maxCombined > 0) {
+        for (const c of combined) {
+          const rrfNorm = c.combinedScore / maxCombined;
+          const f = lifecycle.get(c.obsId);
+          // Decay only when a record exists; compoundScore with undefined
+          // returns rrfNorm unchanged (the no-lifecycle fallback).
+          c.combinedScore = compoundScore(
+            rrfNorm,
+            f ? applyDecay(f, now) : undefined,
+          );
+        }
+      }
+    }
+
     combined.sort((a, b) => b.combinedScore - a.combinedScore);
 
     const retrievalDepth = Math.max(limit, 20);
     const rerankWindow = 20;
     const diversified = this.diversifyBySession(combined, retrievalDepth);
     const enriched = await this.enrichResults(diversified, retrievalDepth);
+
+    // --- Best-effort access reinforcement (fire-and-forget) ---
+    // Bump the lifecycle of the observations we are about to return so
+    // frequently-recalled knowledge gains importance and resets recency.
+    // This MUST NOT block or break the response: we do not await it, and
+    // every failure path (no backend, memory no-op, partial read) is
+    // swallowed so search latency and correctness are unaffected.
+    if (this.vector && enriched.length > 0 && lifecycle.size > 0) {
+      const vector = this.vector;
+      const now = Date.now();
+      // Reinforce curated knowledge only. Breadcrumb observations (file
+      // reads/edits, searches, command runs, etc.) are intentionally NOT
+      // reinforced on recall: bumping their importance + promoting their
+      // maturity tier would pull high-volume, low-signal noise into the
+      // tierBoost tiers and keep it from ever aging out. Gating strictly by
+      // ObservationType lets curated memories and high-signal types
+      // (decision/discovery/image) keep climbing while breadcrumbs decay.
+      const reinforceIds = enriched
+        .filter((e) => !isBreadcrumbType(e.observation.type))
+        .map((e) => e.observation.id);
+      // Reuse the lifecycle records already fetched for the re-rank above
+      // instead of a second getLifecycle round-trip for a subset of the same
+      // ids. The map holds the raw, un-decayed records reinforceOnAccess
+      // expects (the re-rank decays a copy, never mutating the map).
+      void Promise.all(
+        reinforceIds.map((id) => {
+          const f = lifecycle.get(id);
+          if (!f) return Promise.resolve();
+          // Bump importance/recency, then recompute the maturity tier so an
+          // access that pushes importance past a promote threshold takes
+          // effect immediately (demotion on decay is handled by the daily
+          // lifecycle sweep, which sees decayed importance).
+          const reinforced = reinforceOnAccess(f, now);
+          return vector.setLifecycle(id, {
+            ...reinforced,
+            maturity: nextMaturity(reinforced),
+          });
+        }),
+      ).catch(() => {
+        // best-effort: ignore all reinforcement failures
+      });
+    }
 
     if (this.rerankEnabled && enriched.length > 1) {
       try {

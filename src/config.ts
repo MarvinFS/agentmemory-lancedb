@@ -188,6 +188,27 @@ export function isDropStaleIndexEnabled(): boolean {
   return getMergedEnv()["AGENTMEMORY_DROP_STALE_INDEX"] === "true";
 }
 
+// Pluggable vector-store backend (see src/state/vector-store.ts). Default
+// "memory" preserves the in-memory + iii-KV behavior; "lancedb" moves
+// vectors (per-row) and the BM25 blob onto LanceDB's own on-disk files,
+// out of the iii KV. "sqlite-vec" / "iii" are reserved.
+export function getVectorBackendKind():
+  | "memory"
+  | "lancedb"
+  | "sqlite-vec"
+  | "iii" {
+  const raw = (getMergedEnv()["VECTOR_BACKEND"] || "memory").toLowerCase();
+  if (
+    raw === "lancedb" ||
+    raw === "sqlite-vec" ||
+    raw === "iii" ||
+    raw === "memory"
+  ) {
+    return raw;
+  }
+  return "memory";
+}
+
 export function detectLlmProviderKind(): "llm" | "noop" {
   const env = getMergedEnv();
   if (

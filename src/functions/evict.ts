@@ -10,6 +10,8 @@ import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
+import { deleteObservationCascade } from "./_observation-cascade.js";
+import { vectorIndexOptimize } from "./search.js";
 import { logger } from "../logger.js";
 
 interface EvictionConfig {
@@ -193,6 +195,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           if (!o.timestamp) continue;
           const age = now - new Date(o.timestamp).getTime();
           const maxAge = cfg.lowImportanceMaxDays * MS_PER_DAY;
+          // The `?? 5` default means an observation written WITHOUT an importance field is never pruned here (5 >= default threshold 3) - harmless today since synthetic breadcrumbs always set importance, but a latent trap for externally-written observations.
           if (
             age > maxAge &&
             (o.importance ?? 5) < cfg.lowImportanceThreshold
@@ -212,13 +215,21 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 });
                 continue;
               }
-              if (o.imageData) await decrementImageRef(kv, sdk, o.imageData);
-              if (o.imageRef && o.imageRef !== o.imageData) await decrementImageRef(kv, sdk, o.imageRef);
-              await recordAudit(kv, "delete", "mem::evict", [o.id], {
-                resource: "observation",
-                reason: "low_importance_old_observation",
-                sessionId: session.id,
-                dryRun,
+              await deleteObservationCascade(kv, sdk, {
+                obsId: o.id,
+                imageData: o.imageData,
+                imageRef: o.imageRef,
+                removeFromIndex: false,
+                audit: {
+                  operation: "delete",
+                  functionId: "mem::evict",
+                  details: {
+                    resource: "observation",
+                    reason: "low_importance_old_observation",
+                    sessionId: session.id,
+                    dryRun,
+                  },
+                },
               });
             }
           }
@@ -255,13 +266,21 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 });
                 continue;
               }
-              if (o.imageData) await decrementImageRef(kv, sdk, o.imageData);
-              if (o.imageRef && o.imageRef !== o.imageData) await decrementImageRef(kv, sdk, o.imageRef);
-              await recordAudit(kv, "delete", "mem::evict", [o.id], {
-                resource: "observation",
-                reason: "project_observation_cap",
-                sessionId: o.sessionId,
-                dryRun,
+              await deleteObservationCascade(kv, sdk, {
+                obsId: o.id,
+                imageData: o.imageData,
+                imageRef: o.imageRef,
+                removeFromIndex: false,
+                audit: {
+                  operation: "delete",
+                  functionId: "mem::evict",
+                  details: {
+                    resource: "observation",
+                    reason: "project_observation_cap",
+                    sessionId: o.sessionId,
+                    dryRun,
+                  },
+                },
               });
             }
           }
@@ -337,6 +356,19 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               await deleteAccessLog(kv, mem.id);
             }
           }
+        }
+      }
+
+      // Compact the vector table once after the whole eviction pass, never
+      // per-id. Guarded + best-effort: a compaction failure must not fail the
+      // eviction. No-op on non-LanceDB backends.
+      if (!dryRun) {
+        try {
+          await vectorIndexOptimize();
+        } catch (err) {
+          logger.warn("Vector index optimize after eviction failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }
 

@@ -12,6 +12,7 @@ import {
   isConsolidationEnabled,
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
+  getVectorBackendKind,
 } from "./config.js";
 import {
   createProvider,
@@ -22,6 +23,16 @@ import {
 import { StateKV } from "./state/kv.js";
 import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
+import { createPersistenceBackends } from "./state/vector-store.js";
+import {
+  GraphRoutingKV,
+  backfillGraphIfEmpty,
+  type GraphKvStore,
+} from "./state/graph-kv-router.js";
+import {
+  KvIndexBlobStore,
+  type IndexBlobStore,
+} from "./state/index-blob-store.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
@@ -46,6 +57,7 @@ import { registerFileIndexFunction } from "./functions/file-index.js";
 import { registerConsolidateFunction } from "./functions/consolidate.js";
 import { registerPatternsFunction } from "./functions/patterns.js";
 import { registerRememberFunction } from "./functions/remember.js";
+import { registerLifecycleSweepFunction } from "./functions/lifecycle-sweep.js";
 import { registerEvictFunction } from "./functions/evict.js";
 import { registerRelationsFunction } from "./functions/relations.js";
 import { registerTimelineFunction } from "./functions/timeline.js";
@@ -76,6 +88,9 @@ import { registerDiagnosticsFunction } from "./functions/diagnostics.js";
 import { registerFacetsFunction } from "./functions/facets.js";
 import { registerVerifyFunction } from "./functions/verify.js";
 import { registerCascadeFunction } from "./functions/cascade.js";
+import { registerObservationPruneFunction } from "./functions/observation-prune.js";
+import { registerGraphPruneFunction } from "./functions/graph-prune.js";
+import { initLessonVectorStore } from "./state/lesson-vectors.js";
 import { registerLessonsFunctions } from "./functions/lessons.js";
 import { registerObsidianExportFunction } from "./functions/obsidian-export.js";
 import { registerReflectFunctions } from "./functions/reflect.js";
@@ -215,15 +230,63 @@ async function main() {
 
   writeWorkerPidfile();
 
-  const kv = new StateKV(sdk);
+  const baseKv = new StateKV(sdk);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
-  const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
-  const vectorIndex = embeddingProvider ? new VectorIndex() : null;
+  // Vector + BM25 persistence backends. With an embedding provider the
+  // selected VECTOR_BACKEND owns the vector index (and, for lancedb, the
+  // BM25 blob + graph KV too); without one there are no vectors and BM25 stays
+  // in the iii KV. createPersistenceBackends opens lancedb's tables and caches
+  // its row count before returning, so VectorIndex.size is valid at boot below.
+  let vectorIndex: VectorIndex | null = null;
+  let indexBlobStore: IndexBlobStore;
+  let graphKv: GraphKvStore | undefined;
+  if (embeddingProvider) {
+    const backends = await createPersistenceBackends({
+      kv: baseKv,
+      dataDir: config.dataDir,
+      dimensions: embeddingProvider.dimensions,
+      backend: getVectorBackendKind(),
+    });
+    vectorIndex = backends.vector;
+    indexBlobStore = backends.blobStore;
+    graphKv = backends.graphKv;
+  } else {
+    indexBlobStore = new KvIndexBlobStore(baseKv);
+  }
+
+  // When a self-persisting backend owns its files (lancedb), route the graph's
+  // KV scopes to it - out of the iii KV - and migrate the existing graph once.
+  // Otherwise the graph stays in the iii KV via the plain StateKV. Every other
+  // scope always falls through to the iii KV regardless.
+  const kv = graphKv ? new GraphRoutingKV(sdk, graphKv) : baseKv;
+  const metricsStore = new MetricsStore(kv);
+  if (graphKv) {
+    try {
+      const r = await backfillGraphIfEmpty(baseKv, graphKv);
+      bootLog(
+        r.migrated
+          ? `Graph backend: LanceDB (migrated ${r.nodes} nodes, ${r.edges} edges, ${r.history} history from iii KV)`
+          : `Graph backend: LanceDB (already populated: ${r.nodes} nodes, ${r.edges} edges)`,
+      );
+    } catch (err) {
+      bootLog(
+        `Graph backfill skipped (error): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 
   setVectorIndex(vectorIndex);
   setEmbeddingProvider(embeddingProvider);
+
+  if (embeddingProvider) {
+    await initLessonVectorStore({
+      dataDir: config.dataDir,
+      dimensions: embeddingProvider.dimensions,
+      backend: getVectorBackendKind(),
+    });
+  }
 
   const meterAccessor = hasGetMeter(sdk)
     ? (sdk.getMeter.bind(sdk) as (name: string) => unknown)
@@ -249,6 +312,7 @@ async function main() {
   registerPatternsFunction(sdk, kv);
   registerRememberFunction(sdk, kv);
   registerEvictFunction(sdk, kv);
+  registerObservationPruneFunction(sdk, kv);
 
   registerRelationsFunction(sdk, kv);
   registerTimelineFunction(sdk, kv);
@@ -324,6 +388,7 @@ async function main() {
   registerWorkingMemoryFunctions(sdk, kv, config.tokenBudget);
   registerSkillExtractFunctions(sdk, kv, provider);
   registerCascadeFunction(sdk, kv);
+  registerGraphPruneFunction(sdk, kv);
 
   registerSlidingWindowFunction(sdk, kv, provider);
   registerQueryExpansionFunction(sdk, provider);
@@ -331,6 +396,7 @@ async function main() {
   registerRetentionFunctions(sdk, kv);
   registerCompressFileFunction(sdk, kv, provider);
   registerReplayFunctions(sdk, kv);
+  registerLifecycleSweepFunction(sdk);
   bootLog(
     `v0.6 advanced retrieval: sliding-window, query-expansion, temporal-graph, retention-scoring`,
   );
@@ -373,7 +439,11 @@ async function main() {
 
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
-  const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex);
+  const indexPersistence = new IndexPersistence(
+    indexBlobStore,
+    bm25Index,
+    vectorIndex,
+  );
   // Wire the persistence hook so delete paths can flush BM25/vector
   // index mutations to disk. Without this, an in-memory remove can be
   // lost across a hard process exit and the persisted snapshot
@@ -390,7 +460,13 @@ async function main() {
       `Loaded persisted BM25 index (${bm25Index.size} docs)`,
     );
   }
-  if (loaded?.vector && vectorIndex && loaded.vector.size > 0) {
+  // Restore in-memory vectors from the blob (no-op for self-persisting
+  // backends like lancedb, which already opened their data from disk at
+  // construction; their vectorJson is null).
+  if (loaded?.vectorJson && vectorIndex) {
+    await vectorIndex.restoreFrom(loaded.vectorJson);
+  }
+  if (vectorIndex && vectorIndex.size > 0) {
     // Persisted vectors carry whatever dimension the provider had when
     // they were written. If the active provider declares a different
     // dimension — or if the on-disk index contains a mix of dimensions
@@ -403,7 +479,7 @@ async function main() {
     const activeDim = embeddingProvider?.dimensions ?? 0;
     const { mismatches, seenDimensions } =
       activeDim > 0
-        ? loaded.vector.validateDimensions(activeDim)
+        ? await vectorIndex.validateDimensions(activeDim)
         : { mismatches: [], seenDimensions: new Set<number>() };
 
     if (mismatches.length > 0) {
@@ -416,16 +492,17 @@ async function main() {
       if (dropStale) {
         console.warn(
           `[agentmemory] Persisted vector index has ${mismatches.length} of ` +
-            `${loaded.vector.size} vectors with the wrong dimension. Active ` +
+            `${vectorIndex.size} vectors with the wrong dimension. Active ` +
             `provider (${embeddingProvider?.name}) declares ${activeDim}; ` +
             `dimensions seen on disk: ${distinct}. ` +
             `AGENTMEMORY_DROP_STALE_INDEX=true is set — discarding the persisted ` +
             `vectors. Live observations will rebuild the index over time.`,
         );
+        await vectorIndex.clear();
       } else {
         throw new Error(
           `[agentmemory] Refusing to start: persisted vector index has ` +
-            `${mismatches.length} of ${loaded.vector.size} vectors with the ` +
+            `${mismatches.length} of ${vectorIndex.size} vectors with the ` +
             `wrong dimension. Active provider (${embeddingProvider?.name}) ` +
             `declares ${activeDim}; dimensions seen on disk: ${distinct}. ` +
             `First mismatched obsIds: ${sample}. Loading would silently corrupt ` +
@@ -437,14 +514,23 @@ async function main() {
         );
       }
     } else {
-      vectorIndex.restoreFrom(loaded.vector);
       bootLog(
         `Loaded persisted vector index (${vectorIndex.size} vectors)`,
       );
     }
   }
 
-  const needsRebuild = bm25Index.size === 0;
+  // Rebuild when BM25 is empty, OR when an embedding provider is configured
+  // but the vector index is empty while BM25 is not. The latter happens after
+  // a DROP_STALE dimension-mismatch clear() (or any path that empties the
+  // vector store while the BM25 blob survives): leaving it would strand
+  // semantic search with zero vectors and no recovery. rebuildIndex re-embeds
+  // the whole corpus (fire-and-forget below, so boot is not blocked).
+  const needsRebuild =
+    bm25Index.size === 0 ||
+    (vectorIndex !== null &&
+      embeddingProvider !== null &&
+      vectorIndex.size === 0);
 
   if (needsRebuild) {
     // Fire-and-forget. rebuildIndex iterates every observation across
@@ -508,6 +594,27 @@ async function main() {
     }
   }
 
+  // Periodic LanceDB compaction. Live writes each create a new on-disk
+  // version; without periodic compaction the index accrues unbounded
+  // fragments. Hourly optimize()+prune keeps it tight. No-op for the
+  // in-memory backend; unref so it never holds the process open at exit.
+  if (vectorIndex || graphKv) {
+    const vi = vectorIndex;
+    const gkv = graphKv;
+    const optimizeTimer = setInterval(
+      () => {
+        vi?.optimize().catch((err) => {
+          console.warn(`[agentmemory] vector index optimize failed:`, err);
+        });
+        gkv?.optimize?.().catch((err) => {
+          console.warn(`[agentmemory] graph kv optimize failed:`, err);
+        });
+      },
+      60 * 60 * 1000,
+    );
+    optimizeTimer.unref?.();
+  }
+
   // Ready / Endpoints lines are emitted via `bootLog` so they're
   // buffered in quiet mode and printed verbatim under --verbose. The
   // CLI surfaces a compact summary when it sees the worker reach
@@ -516,7 +623,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 125 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 128 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
@@ -571,6 +678,28 @@ async function main() {
     }, consolidationIntervalMs);
     consolidationTimer.unref();
     bootLog(`Auto-consolidation: enabled (every ${consolidationIntervalMs / 60000}m)`);
+  }
+
+  if (process.env.LIFECYCLE_SWEEP_ENABLED !== "false") {
+    const parsedSweepInterval = parseInt(
+      process.env.LIFECYCLE_SWEEP_INTERVAL_MS || "86400000",
+      10,
+    );
+    // Guard against a non-numeric override (parseInt -> NaN) or a non-positive
+    // value: setInterval(fn, NaN) coerces the delay to 0 and would spin the
+    // sweep — a full listLifecycle scan plus tier writes — on every event-loop
+    // tick. Fall back to the 24h default.
+    const lifecycleSweepIntervalMs =
+      Number.isFinite(parsedSweepInterval) && parsedSweepInterval > 0
+        ? parsedSweepInterval
+        : 86400000;
+    const lifecycleSweepTimer = setInterval(async () => {
+      try {
+        await sdk.trigger({ function_id: "mem::lifecycle-sweep", payload: {} });
+      } catch {}
+    }, lifecycleSweepIntervalMs);
+    lifecycleSweepTimer.unref();
+    bootLog(`Lifecycle sweep: enabled (maturity demotion + GC review, every ${lifecycleSweepIntervalMs / 3600000}h)`);
   }
 
   const shutdown = async () => {

@@ -5,15 +5,28 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { resolveProject } from "../src/hooks/_project.js";
 
+// Derive the expected basename the same way the resolver does (git toplevel
+// basename) instead of hardcoding "agentmemory". The clone dir may be named
+// anything (e.g. "agentmemory-lancedb"), so a hardcoded literal is not
+// hermetic. Falls back to the cwd basename if not in a git repo.
+function expectedRepoBasename(): string {
+  try {
+    const top = execSync("git rev-parse --show-toplevel", {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 500,
+    })
+      .toString()
+      .trim();
+    if (top) return basename(top);
+  } catch {}
+  return basename(process.cwd());
+}
+
 describe("resolveProject — hook project basename resolver", () => {
   const originalEnv = process.env.AGENTMEMORY_PROJECT_NAME;
+  const repoBasename = expectedRepoBasename();
 
-  // Derive the expected name from the real git toplevel the same way
-  // resolveProject does, so the suite passes regardless of the checkout's
-  // directory name (e.g. upstream "agentmemory" vs a fork "agentmemory-lancedb").
-  const repoBasename = basename(
-    execSync("git rev-parse --show-toplevel").toString().trim(),
-  );
 
   beforeEach(() => {
     delete process.env.AGENTMEMORY_PROJECT_NAME;
@@ -56,7 +69,7 @@ describe("resolveProject — hook project basename resolver", () => {
   it("falls back to basename(cwd) when not in a git repo", () => {
     const dir = mkdtempSync(join(tmpdir(), "amem-noproj-"));
     try {
-      expect(resolveProject(dir)).toBe(dir.split("/").pop());
+      expect(resolveProject(dir)).toBe(basename(dir));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

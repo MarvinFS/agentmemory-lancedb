@@ -270,7 +270,7 @@ describe("mem::summarize chunking", () => {
     expect(stored?.title).toBe("merged");
   });
 
-  it("persistently-broken chunk is skipped, reduce still runs on remaining partials", async () => {
+  it("persistently-broken chunk degrades to a synthetic partial; reduce runs on all 3", async () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "100";
     process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
     const provider = makeProvider([
@@ -288,24 +288,26 @@ describe("mem::summarize chunking", () => {
     const result: any = await handler({ sessionId: "ses_skip" });
 
     expect(result.success).toBe(true);
-    // 1 ok + (1 + 1 retry skip) + 1 ok + 1 reduce = 5 calls.
+    // 1 ok + (1 + 1 retry, both parse-fail) + 1 ok + 1 reduce = 5 provider
+    // calls; the synthetic fallback for chunk 2 adds no provider call.
     expect(provider.calls).toHaveLength(5);
-    // Reduce input should mention only 2 of 3 chunks (chunk 2 skipped) —
-    // but the chunk indices in the reduce labels should reflect chunk 1 and 3,
-    // preserving chronological boundaries.
+    // Chunk 2 is no longer dropped: it degrades to a synthetic summary, so the
+    // reduce step sees all 3 chunks in chronological order.
     const reduceCall = provider.calls[4];
-    expect(reduceCall.user).toContain("Chunk 1 of 2");
-    expect(reduceCall.user).toContain("Chunk 2 of 2");
-    expect(reduceCall.user).toContain("obs 1-100");        // first surviving chunk
-    expect(reduceCall.user).toContain("obs 201-250");      // third surviving chunk (was idx 2, range 201-250)
+    expect(reduceCall.user).toContain("Chunk 1 of 3");
+    expect(reduceCall.user).toContain("Chunk 2 of 3");
+    expect(reduceCall.user).toContain("Chunk 3 of 3");
+    expect(reduceCall.user).toContain("obs 1-100");        // chunk 1
+    expect(reduceCall.user).toContain("obs 101-200");      // chunk 2 (synthetic)
+    expect(reduceCall.user).toContain("obs 201-250");      // chunk 3
     const stored: any = await kv.get("summaries", "ses_skip");
     expect(stored?.title).toBe("merged-with-skip");
   });
 
-  it("too many skipped chunks bails out with a clear error", async () => {
+  it("broken chunks degrade to synthetic partials instead of bailing", async () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "100";
     process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
-    // 3 chunks, 2 fully broken → >50% skipped → bail.
+    // 3 chunks, 2 fully broken → both salvaged synthetically → success.
     const provider = makeProvider([
       summaryXml({ title: "ok1" }),
       "<garbage/>", "<garbage/>",
@@ -319,8 +321,9 @@ describe("mem::summarize chunking", () => {
 
     const result: any = await handler({ sessionId: "ses_too_broken" });
 
-    expect(result.success).toBe(false);
-    expect(result.error).toMatch(/too_many_chunks_skipped: 2\/3/);
+    // Broken chunks no longer bail the whole summary: each degrades to a
+    // synthetic partial, so the reduce step still produces a summary.
+    expect(result.success).toBe(true);
   });
 
   it("provider error on one chunk after retry is skipped, not propagated", async () => {
@@ -356,10 +359,10 @@ describe("mem::summarize chunking", () => {
     expect(stored?.title).toBe("merged-with-skip");
   });
 
-  it("every chunk failing on provider error trips too_many_chunks_skipped", async () => {
+  it("every chunk throwing still succeeds via synthetic fallback", async () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "100";
     process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
-    // 3 chunks, all chunk calls throw → 3/3 skipped → bail.
+    // 3 chunks, all chunk calls throw → each degrades to synthetic → success.
     const provider: MemoryProvider & { calls: any[] } = {
       name: "test",
       calls: [],
@@ -377,8 +380,9 @@ describe("mem::summarize chunking", () => {
 
     const result: any = await handler({ sessionId: "ses_all_400" });
 
-    expect(result.success).toBe(false);
-    expect(result.error).toMatch(/too_many_chunks_skipped: 3\/3/);
+    // Every chunk and the reduce call throw, but each degrades to a synthetic
+    // summary, so the operation still succeeds rather than bailing.
+    expect(result.success).toBe(true);
   });
 
   it("chunks run in parallel batches according to SUMMARIZE_CHUNK_CONCURRENCY", async () => {

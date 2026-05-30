@@ -3,6 +3,97 @@ import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type { Lesson } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { getEmbeddingProvider, clipEmbedInput } from "./search.js";
+import {
+  getLessonVectorStore,
+  lessonVectorAddGuarded,
+  lessonText,
+} from "../state/lesson-vectors.js";
+import { logger } from "../logger.js";
+
+// English stopword set for lexical lesson recall. A natural-language query
+// like "what did we do for the lancedb rework" otherwise matches unrelated
+// lessons purely through high-frequency function words ("the/for/we/do"),
+// which is the root cause of the ESXi/Veeam/Excel false positives. Stripping
+// these leaves only the content-bearing terms ("lancedb", "rework").
+const LESSON_STOPWORDS = new Set<string>([
+  "a", "an", "the", "of", "for", "to", "we", "i", "do", "did", "does", "done",
+  "what", "how", "why", "when", "where", "who", "which", "and", "or", "but",
+  "in", "on", "at", "by", "is", "it", "this", "that", "these", "those", "be",
+  "was", "were", "are", "am", "as", "with", "from", "into", "about", "our",
+  "us", "you", "your", "they", "them", "their", "he", "she", "his", "her",
+  "its", "my", "me", "can", "could", "would", "should", "will", "shall",
+  "may", "might", "must", "have", "has", "had", "if", "then", "than", "so",
+  "not", "no", "yes", "up", "out", "over", "again", "just", "any", "all",
+  "some", "more", "most", "such", "use", "used", "using", "get", "got",
+]);
+
+// Minimum lexical relevance a lesson must reach to surface. The lexical leg
+// scores in [0, ~confidence]; 0.3 drops the stopword-only false positives
+// (which previously scored ~0.46-0.49 purely on function-word overlap) while
+// keeping genuine single-term content matches. Used both here and gated again
+// in smart-search.ts so weak lessons never reach the smart-search bucket.
+export const LESSON_SCORE_FLOOR = 0.3;
+
+// Tokenize a query into content-bearing, lowercased terms: split on
+// non-word characters, drop stopwords and 1-char noise. Shared by the
+// lexical scorer so query and stored text are tokenized identically.
+function lessonQueryTerms(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 1 && !LESSON_STOPWORDS.has(t));
+}
+
+// Word-boundary term match against pre-tokenized lesson text. The old code
+// used text.includes(term), so "do" matched "domain" and "id" matched
+// "video". Matching against a Set of whole tokens enforces boundaries
+// without a per-term regex compile.
+function lessonTokenSet(text: string): Set<string> {
+  return new Set(
+    text.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 0),
+  );
+}
+
+// Memoize each lesson's token Set keyed on `${id}:${updatedAt}`. lexicalLessonScore
+// runs for every in-scope lesson on every recall and otherwise rebuilds the Set
+// from scratch each time; the key invalidates automatically whenever a lesson
+// changes (reinforce, decay, and context edits all bump updatedAt, the only
+// fields lessonText reads). We store a single key per lesson id — inserting a new
+// updatedAt deletes the prior key — so the cache stays O(number of lessons).
+const lessonTokenCache = new Map<string, Set<string>>();
+const lessonTokenKeyById = new Map<string, string>();
+
+function cachedLessonTokenSet(lesson: Lesson): Set<string> {
+  const key = `${lesson.id}:${lesson.updatedAt}`;
+  const cached = lessonTokenCache.get(key);
+  if (cached) return cached;
+  const tokens = lessonTokenSet(lessonText(lesson));
+  const prevKey = lessonTokenKeyById.get(lesson.id);
+  if (prevKey && prevKey !== key) lessonTokenCache.delete(prevKey);
+  lessonTokenCache.set(key, tokens);
+  lessonTokenKeyById.set(lesson.id, key);
+  return tokens;
+}
+
+// Lexical relevance of one lesson to a set of query terms, in [0, confidence].
+// confidence * (matchedTerms / totalTerms) * recencyBoost — identical shape to
+// the original scorer, but term matching is now whole-token (word-boundary)
+// and stopword-free. Returns 0 when nothing content-bearing matches.
+function lexicalLessonScore(lesson: Lesson, terms: string[]): number {
+  if (terms.length === 0) return 0;
+  const tokens = cachedLessonTokenSet(lesson);
+  const matchCount = terms.filter((t) => tokens.has(t)).length;
+  if (matchCount === 0) return 0;
+  const relevance = matchCount / terms.length;
+  const daysSinceReinforced = lesson.lastReinforcedAt
+    ? (Date.now() - new Date(lesson.lastReinforcedAt).getTime()) /
+      (1000 * 60 * 60 * 24)
+    : (Date.now() - new Date(lesson.createdAt).getTime()) /
+      (1000 * 60 * 60 * 24);
+  const recencyBoost = 1 / (1 + daysSinceReinforced * 0.01);
+  return lesson.confidence * relevance * recencyBoost;
+}
 
 function reinforceLesson(lesson: Lesson): void {
   const now = new Date().toISOString();
@@ -35,10 +126,20 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
 
       if (existing && !existing.deleted) {
         reinforceLesson(existing);
+        // Re-embedding is only needed when the embedded text actually changed.
+        // The lesson id is a fingerprint of content, so content is identical on
+        // a strengthen; only a newly-added context alters lessonText(). Track
+        // that to avoid a wasted embed call on every reinforcement.
+        let contextChanged = false;
         if (data.context && !existing.context) {
           existing.context = data.context;
+          contextChanged = true;
         }
         await kv.set(KV.lessons, existing.id, existing);
+
+        if (contextChanged) {
+          await lessonVectorAddGuarded(existing);
+        }
 
         try {
           await recordAudit(kv, "lesson_strengthen", "mem::lesson-save", [
@@ -78,6 +179,12 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
 
       await kv.set(KV.lessons, lesson.id, lesson);
 
+      // Embed the lesson into the lessons vector table so paraphrased recall
+      // works. Best-effort: a downed embedder or the memory backend (no lesson
+      // table) leaves recall on the lexical leg. Mirrors remember.ts, which
+      // also embeds after the KV write without blocking the save.
+      await lessonVectorAddGuarded(lesson);
+
       try {
         await recordAudit(kv, "lesson_save", "mem::lesson-save", [lesson.id]);
       } catch {}
@@ -97,7 +204,6 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
         return { success: false, error: "query is required" };
       }
 
-      const query = data.query.toLowerCase();
       const minConfidence = data.minConfidence ?? 0.1;
       const limit = data.limit ?? 10;
 
@@ -111,38 +217,46 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
         lessons = lessons.filter((l) => l.project === data.project);
       }
 
-      const scored = lessons
-        .map((l) => {
-          const text = `${l.content} ${l.context} ${l.tags.join(" ")}`.toLowerCase();
-          const terms = query.split(/\s+/).filter((t) => t.length > 1);
-          const matchCount = terms.filter((t) => text.includes(t)).length;
-          if (matchCount === 0) return null;
+      const byId = new Map<string, Lesson>(lessons.map((l) => [l.id, l]));
 
-          const relevance = matchCount / terms.length;
-          const daysSinceReinforced = l.lastReinforcedAt
-            ? (Date.now() - new Date(l.lastReinforcedAt).getTime()) /
-              (1000 * 60 * 60 * 24)
-            : (Date.now() - new Date(l.createdAt).getTime()) /
-              (1000 * 60 * 60 * 24);
-          const recencyBoost = 1 / (1 + daysSinceReinforced * 0.01);
-          const score = l.confidence * relevance * recencyBoost;
+      // --- Lexical leg (Phase A, always on) ------------------------------
+      // Stopword-stripped, word-boundary scoring with a relevance floor. This
+      // leg is fully self-sufficient: if the vector leg is disabled or fails,
+      // recall degrades to exactly this hardened lexical behavior.
+      const terms = lessonQueryTerms(data.query);
+      const lexical = lessons
+        .map((l) => ({ lesson: l, score: lexicalLessonScore(l, terms) }))
+        .filter((s) => s.score >= LESSON_SCORE_FLOOR);
+      lexical.sort((a, b) => b.score - a.score);
 
-          return { lesson: l, score };
-        })
-        .filter(Boolean) as Array<{ lesson: Lesson; score: number }>;
+      // --- Vector leg (Phase B, best-effort) -----------------------------
+      // Semantic recall over the lessons LanceDB table. Paraphrased queries
+      // ("rework" vs "migration") retrieve the right lesson here even when no
+      // surface term overlaps. Embedding/search failures are swallowed so the
+      // lexical leg above still answers.
+      const vectorHits = await recallLessonVectors(data.query, byId);
 
-      scored.sort((a, b) => b.score - a.score);
+      // --- Fuse via Reciprocal Rank Fusion (RRF, k=60) -------------------
+      // Mirrors hybrid-search.ts's fusion of BM25 + vector. Each leg
+      // contributes 1/(RRF_K + rank); a lesson found by both legs ranks
+      // above one found by a single leg. We keep the lexical leg's raw score
+      // as the surfaced `score` (back-compat with the prior contract) and use
+      // RRF only for ordering. Pure-vector hits that never cleared the
+      // lexical floor still appear, carrying their semantic similarity as the
+      // surfaced score.
+      const fused = fuseLessonLegs(lexical, vectorHits);
+      fused.sort((a, b) => b.rrf - a.rrf);
 
       try {
         await recordAudit(kv, "lesson_recall", "mem::lesson-recall", [], {
           query: data.query,
-          resultCount: scored.length,
+          resultCount: fused.length,
         });
       } catch {}
 
       return {
         success: true,
-        lessons: scored.slice(0, limit).map((s) => ({
+        lessons: fused.slice(0, limit).map((s) => ({
           ...s.lesson,
           score: Math.round(s.score * 1000) / 1000,
         })),
@@ -259,6 +373,29 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       }
 
       await Promise.all(dirty.map((l) => kv.set(KV.lessons, l.id, l)));
+
+      // Drop vectors for soft-deleted lessons so they stop occupying the
+      // lessons table. Recall already filters l.deleted out via byId, so this
+      // is housekeeping, not correctness; best-effort, never blocks the sweep.
+      const removedIds = auditEvents
+        .filter((e) => e.action === "soft-delete")
+        .map((e) => e.id);
+      if (removedIds.length > 0) {
+        const store = getLessonVectorStore();
+        if (store) {
+          await Promise.all(
+            removedIds.map((id) =>
+              store.remove(id).catch((err: unknown) => {
+                logger.warn("lesson-decay-sweep: vector remove failed", {
+                  lessonId: id,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }),
+            ),
+          );
+        }
+      }
+
       await Promise.all(
         auditEvents.map((event) =>
           recordAudit(kv, "lesson_strengthen", "mem::lesson-decay-sweep", [event.id], {
@@ -280,4 +417,180 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       return { success: true, decayed, softDeleted, total: lessons.length };
     },
   );
+
+  // One-time (and idempotent) backfill: embed every existing non-deleted
+  // lesson into the lessons vector table. Lessons predate Phase B, so their
+  // vectors don't exist until this runs. Uses a single clear() + one bulk
+  // insert per batch (NOT per-row add) to avoid LanceDB write amplification,
+  // mirroring rebuildIndex()/vectorIndexAddBatchGuarded in search.ts. Safe to
+  // re-run: it clears the lessons table and re-embeds from KV.lessons, so the
+  // table always reflects current lesson content. No-op (success, embedded:0)
+  // when no embedding provider or no lessons vector backend is configured.
+  sdk.registerFunction("mem::lesson-embed-backfill",
+    async (data?: { batchSize?: number }) => {
+      const store = getLessonVectorStore();
+      const provider = getEmbeddingProvider();
+      if (!store || !provider) {
+        return {
+          success: true,
+          embedded: 0,
+          failed: 0,
+          skipped: "no lessons vector backend or embedding provider",
+        };
+      }
+
+      const batchSize =
+        typeof data?.batchSize === "number" &&
+        Number.isInteger(data.batchSize) &&
+        data.batchSize > 0
+          ? data.batchSize
+          : 32;
+
+      const all = await kv.list<Lesson>(KV.lessons);
+      const live = all.filter((l) => !l.deleted);
+
+      // Clear first so the table reflects current content on every run and
+      // every row is a fresh bulk insert (no O(n) existence check per row).
+      try {
+        await store.clear();
+      } catch (err) {
+        logger.warn("lesson-embed-backfill: clear failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return { success: false, embedded: 0, failed: live.length };
+      }
+
+      let embedded = 0;
+      let failed = 0;
+      for (let i = 0; i < live.length; i += batchSize) {
+        const chunk = live.slice(i, i + batchSize);
+        let embeddings: Float32Array[];
+        try {
+          embeddings = await provider.embedBatch(chunk.map(lessonText));
+        } catch (err) {
+          logger.warn("lesson-embed-backfill: embedBatch failed — skipping batch", {
+            batchSize: chunk.length,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          failed += chunk.length;
+          continue;
+        }
+        if (embeddings.length !== chunk.length) {
+          failed += chunk.length;
+          continue;
+        }
+        const rows: Array<{ lessonId: string; embedding: Float32Array }> = [];
+        for (let j = 0; j < chunk.length; j++) {
+          // A provider can return the right COUNT but a sparse/undefined slot;
+          // reading .length off undefined would throw here, outside the
+          // bulkAdd try, and abort the whole backfill with the table already
+          // cleared (every lesson loses its vector). Guard the slot first.
+          if (!embeddings[j] || embeddings[j].length !== provider.dimensions) {
+            failed++;
+            continue;
+          }
+          rows.push({ lessonId: chunk[j].id, embedding: embeddings[j] });
+        }
+        try {
+          await store.bulkAdd(rows);
+          embedded += rows.length;
+        } catch (err) {
+          logger.warn("lesson-embed-backfill: bulk insert failed — skipping batch", {
+            batchSize: rows.length,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          failed += rows.length;
+        }
+      }
+
+      try {
+        await store.optimize();
+      } catch {}
+
+      logger.info("Lesson embed backfill complete", {
+        embedded,
+        failed,
+        total: live.length,
+      });
+      return { success: true, embedded, failed, total: live.length };
+    },
+  );
+}
+
+// Run the lessons vector leg of recall: embed the query, ANN-search the
+// lessons table, and map each hit back to its in-scope Lesson. Returns
+// rank-ordered { lesson, score } where score is the cosine similarity. Drops
+// hits whose lesson is missing from `byId` (soft-deleted / filtered out by
+// project or confidence). Best-effort: any failure (no backend, downed
+// embedder) yields an empty array so the lexical leg stands alone.
+async function recallLessonVectors(
+  query: string,
+  byId: Map<string, Lesson>,
+): Promise<Array<{ lesson: Lesson; score: number }>> {
+  const store = getLessonVectorStore();
+  const provider = getEmbeddingProvider();
+  if (!store || !provider || store.size === 0) return [];
+  try {
+    // Clip like the write path (lessonVectorAddGuarded); an over-length query
+    // would otherwise throw inside embed() and silently disable the whole
+    // vector leg for that recall.
+    const embedding = await provider.embed(clipEmbedInput(query));
+    if (embedding.length !== provider.dimensions) return [];
+    // Over-fetch a little so project/confidence filtering still leaves a
+    // useful number of in-scope semantic hits.
+    const hits = await store.search(embedding, 20);
+    const out: Array<{ lesson: Lesson; score: number }> = [];
+    for (const h of hits) {
+      const lesson = byId.get(h.lessonId);
+      if (lesson) out.push({ lesson, score: h.score });
+    }
+    return out;
+  } catch (err) {
+    logger.warn("lesson-recall: vector leg failed — lexical only", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
+const LESSON_RRF_K = 60;
+
+// Fuse the lexical and vector legs with Reciprocal Rank Fusion, mirroring
+// hybrid-search.ts (1/(K+rank) per leg). The surfaced `score` stays the
+// lexical raw score where available (back-compat with the prior recall
+// contract) and falls back to the vector similarity for pure-semantic hits.
+// `rrf` is the ordering key only.
+function fuseLessonLegs(
+  lexical: Array<{ lesson: Lesson; score: number }>,
+  vector: Array<{ lesson: Lesson; score: number }>,
+): Array<{ lesson: Lesson; score: number; rrf: number }> {
+  const acc = new Map<
+    string,
+    { lesson: Lesson; rrf: number; lexScore?: number; vecScore?: number }
+  >();
+
+  lexical.forEach((s, i) => {
+    acc.set(s.lesson.id, {
+      lesson: s.lesson,
+      rrf: 1 / (LESSON_RRF_K + i + 1),
+      lexScore: s.score,
+    });
+  });
+
+  vector.forEach((s, i) => {
+    const contrib = 1 / (LESSON_RRF_K + i + 1);
+    const existing = acc.get(s.lesson.id);
+    if (existing) {
+      existing.rrf += contrib;
+      existing.vecScore = s.score;
+    } else {
+      acc.set(s.lesson.id, { lesson: s.lesson, rrf: contrib, vecScore: s.score });
+    }
+  });
+
+  return Array.from(acc.values()).map((e) => ({
+    lesson: e.lesson,
+    score: e.lexScore ?? e.vecScore ?? 0,
+    rrf: e.rrf,
+  }));
 }

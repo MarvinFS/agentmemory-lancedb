@@ -372,7 +372,7 @@ export function registerRetentionFunctions(
           await kv.delete(KV.retentionScores, candidate.memoryId);
           await deleteAccessLog(kv, candidate.memoryId);
           getSearchIndex().remove(candidate.memoryId);
-          vectorIndexRemove(candidate.memoryId);
+          await vectorIndexRemove(candidate.memoryId);
           evicted++;
           evictedIds.push(candidate.memoryId);
           if (resolvedSource === "semantic") evictedSemantic++;

@@ -3,7 +3,7 @@ import type { CompactSearchResult, CompressedObservation, Memory, SearchResult, 
 import { KV } from '../state/schema.js'
 import { StateKV } from '../state/kv.js'
 import { SearchIndex } from '../state/search-index.js'
-import { VectorIndex } from '../state/vector-index.js'
+import { VectorIndex, type VectorAddItem } from '../state/vector-index.js'
 import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation } from '../state/memory-utils.js'
 import { recordAccessBatch } from './access-tracker.js'
@@ -34,8 +34,20 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
   return currentEmbeddingProvider
 }
 
-export function vectorIndexRemove(id: string): void {
-  vectorIndex?.remove(id);
+export async function vectorIndexRemove(id: string): Promise<void> {
+  await vectorIndex?.remove(id);
+}
+
+// Compact the vector table and prune the versions/fragments created by a
+// bulk-delete loop. Call ONCE after such a loop, never per-id: each per-id
+// vectorIndexRemove creates a new Lance version, so a sweep of N deletes
+// leaves N fragments behind until this runs. Capability-guarded end to end —
+// VectorIndex.optimize() delegates to backend.optimize?.() and resolves to a
+// no-op for backends that don't implement it (the in-memory backend), so this
+// never throws on a non-LanceDB store. Callers still wrap it in try/catch:
+// a compaction failure must never fail the prune that triggered it.
+export async function vectorIndexOptimize(): Promise<void> {
+  await vectorIndex?.optimize();
 }
 
 // Persistence sync hook. Without this, index removals only live in
@@ -111,7 +123,7 @@ export async function vectorIndexAddGuarded(
       })
       return false
     }
-    vi.add(id, sessionId, embedding)
+    await vi.add(id, sessionId, embedding)
     return true
   } catch (err) {
     logger.warn("vector-index add: embed failed — skipping", {
@@ -170,7 +182,7 @@ export async function vectorIndexAddBatchGuarded(
     return { ok: 0, fail: items.length }
   }
 
-  let ok = 0
+  const valid: VectorAddItem[] = []
   let fail = 0
   for (let i = 0; i < items.length; i++) {
     const item = items[i]
@@ -186,19 +198,22 @@ export async function vectorIndexAddBatchGuarded(
       fail++
       continue
     }
-    try {
-      vi.add(item.id, item.sessionId, embedding)
-      ok++
-    } catch (err) {
-      logger.warn("vector-index add batch: index write failed — skipping item", {
-        kind: item.context.kind,
-        id: item.context.logId,
-        error: err instanceof Error ? err.message : String(err),
-      })
-      fail++
-    }
+    valid.push({ obsId: item.id, sessionId: item.sessionId, embedding })
   }
-  return { ok, fail }
+  // One bulk commit per batch instead of a per-vector write. For a
+  // self-persisting backend (lancedb) this is the difference between one
+  // on-disk version per batch and one per vector (thousands of fragments on a
+  // full-corpus rebuild). rebuildIndex clear()s first, so these are all new ids.
+  try {
+    await vi.bulkAdd(valid)
+    return { ok: valid.length, fail }
+  } catch (err) {
+    logger.warn("vector-index add batch: bulk index write failed — skipping batch", {
+      batchSize: valid.length,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return { ok: 0, fail: fail + valid.length }
+  }
 }
 
 // Embed-batch size for rebuild. Each item is one /v1/embeddings call's
@@ -225,7 +240,7 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
   // symmetric concern — memories/observations deleted between runs
   // would leave orphan embeddings here forever. Clear both before the
   // repopulation loops run, so BM25 and vector stay in sync.
-  vectorIndex?.clear()
+  await vectorIndex?.clear()
 
   const batchSize = getRebuildEmbedBatchSize()
   // Accumulator for the batched embed flush. BM25 add is synchronous and
@@ -315,6 +330,10 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
 
   // Drain the last partial batch.
   await flush()
+  // Compact the freshly bulk-loaded index and prune the versions created
+  // during this rebuild, so a full re-embed doesn't leave fragment bloat
+  // behind. No-op for the in-memory backend.
+  await vectorIndex?.optimize()
   return count
 }
 

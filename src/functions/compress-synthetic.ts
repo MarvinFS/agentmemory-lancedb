@@ -9,6 +9,64 @@ import type {
 // spend. This is the default as of 0.8.8 (#138); users who want richer
 // LLM-generated summaries set AGENTMEMORY_AUTO_COMPRESS=true.
 
+// Breadcrumb observation types. These are the low-signal, high-volume
+// per-tool-call records the auto-capture hooks emit (file reads, edits,
+// searches, command runs, etc.). They are deliberately given LOW importance
+// so the lifecycle GC ages them out, are EXCLUDED from access reinforcement
+// in hybrid-search (so recall does not climb them into the maturity tiers),
+// and are the default target set for mem::observations-prune. Higher-signal
+// types (decision, discovery, image) and curated Memory records are NOT
+// breadcrumbs and keep their normal lifecycle. `error` is a breadcrumb for
+// importance/reinforcement purposes but is excluded from the default prune
+// set (errors are worth keeping for postmortems).
+export const BREADCRUMB_TYPES: ReadonlySet<ObservationType> = new Set([
+  "file_read",
+  "file_write",
+  "file_edit",
+  "command_run",
+  "search",
+  "web_fetch",
+  "conversation",
+  "subagent",
+  "task",
+  "notification",
+  "error",
+  "other",
+]);
+
+export function isBreadcrumbType(type: ObservationType): boolean {
+  return BREADCRUMB_TYPES.has(type);
+}
+
+// Heuristic importance (0-5 scale of CompressedObservation.importance) for a
+// synthetic breadcrumb. Mirrors inferType's tool->type mapping so the value
+// tracks the observation's own type. Low values let mem::auto-forget
+// (importance<=2) and mem::evict (importance<threshold) prune them, instead
+// of the old hardcoded 5 which made every breadcrumb un-prunable.
+function inferImportance(
+  toolName: string | undefined,
+  hookType: string,
+): number {
+  switch (inferType(toolName, hookType)) {
+    case "file_read":
+    case "search":
+    case "web_fetch":
+    case "subagent":
+    case "task":
+    case "notification":
+      return 2;
+    case "command_run":
+    case "file_write":
+    case "file_edit":
+    case "conversation":
+      return 3;
+    case "decision":
+      return 4;
+    default:
+      return 5;
+  }
+}
+
 function inferType(
   toolName: string | undefined,
   hookType: string,
@@ -96,7 +154,7 @@ export function buildSyntheticCompression(
     narrative: truncate(narrativeParts.join(" | "), 400),
     concepts: [],
     files: extractFiles(raw.toolInput),
-    importance: 5,
+    importance: inferImportance(toolName, raw.hookType),
     confidence: 0.3,
   };
   if (raw.modality) result.modality = raw.modality;
