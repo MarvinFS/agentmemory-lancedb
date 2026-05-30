@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { execSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { execSync } from "node:child_process";
 import { resolveProject } from "../src/hooks/_project.js";
 
 // Derive the expected basename the same way the resolver does (git toplevel
@@ -26,6 +26,7 @@ function expectedRepoBasename(): string {
 describe("resolveProject — hook project basename resolver", () => {
   const originalEnv = process.env.AGENTMEMORY_PROJECT_NAME;
   const repoBasename = expectedRepoBasename();
+
 
   beforeEach(() => {
     delete process.env.AGENTMEMORY_PROJECT_NAME;
