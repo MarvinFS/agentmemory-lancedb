@@ -52,7 +52,10 @@ type JsonRpcResponse = {
 };
 
 function isNotification(req: JsonRpcRequest): boolean {
-  return req.id === undefined || req.id === null;
+  // Per JSON-RPC 2.0 §4 a Notification is a request WITHOUT an id member.
+  // An explicit `id: null` is a (discouraged but legal) request and must
+  // receive a response, so only an absent id counts as a notification.
+  return req.id === undefined;
 }
 
 function negotiateProtocolVersion(params: Record<string, unknown>): string {
@@ -85,6 +88,12 @@ async function handleOne(
   req: JsonRpcRequest,
   dispatch: ToolDispatcher,
 ): Promise<JsonRpcResponse | null> {
+  // A batch element can be any JSON value (null, a number, a string). Reject
+  // non-objects up front: reading `.id` / `.method` off `null` throws and would
+  // crash the whole batch handler; a primitive is simply an Invalid Request.
+  if (!req || typeof req !== "object") {
+    return rpcError(null, -32600, "Invalid Request");
+  }
   const rawId = req.id;
   const id: JsonRpcId =
     typeof rawId === "string" || typeof rawId === "number" ? rawId : null;

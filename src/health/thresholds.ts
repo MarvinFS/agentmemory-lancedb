@@ -42,6 +42,13 @@ function parseIntEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseFloatEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 /**
  * Resolve the env-overridable subset of the threshold config. Callers may pass
  * an explicit `config` (which wins over env, which wins over DEFAULTS).
@@ -63,6 +70,20 @@ export function resolveThresholdConfig(): Partial<ThresholdConfig> {
       ) *
       1024 *
       1024,
+    // The real-pressure gate is the most deployment-specific knob (a small
+    // cgroup-limited container can never reach a 4GB RSS ceiling), so expose
+    // both of its bounds to env overrides like the percent/floor knobs above.
+    memoryCriticalRssBytes:
+      parseIntEnv(
+        "AGENTMEMORY_MEMORY_CRITICAL_RSS_MB",
+        DEFAULTS.memoryCriticalRssBytes / (1024 * 1024),
+      ) *
+      1024 *
+      1024,
+    memorySystemFreeFloorRatio: parseFloatEnv(
+      "AGENTMEMORY_MEMORY_SYSTEM_FREE_FLOOR_RATIO",
+      DEFAULTS.memorySystemFreeFloorRatio,
+    ),
   };
 }
 

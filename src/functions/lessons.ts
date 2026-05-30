@@ -3,7 +3,7 @@ import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type { Lesson } from "../types.js";
 import { recordAudit } from "./audit.js";
-import { getEmbeddingProvider } from "./search.js";
+import { getEmbeddingProvider, clipEmbedInput } from "./search.js";
 import {
   getLessonVectorStore,
   lessonVectorAddGuarded,
@@ -460,7 +460,11 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
         }
         const rows: Array<{ lessonId: string; embedding: Float32Array }> = [];
         for (let j = 0; j < chunk.length; j++) {
-          if (embeddings[j].length !== provider.dimensions) {
+          // A provider can return the right COUNT but a sparse/undefined slot;
+          // reading .length off undefined would throw here, outside the
+          // bulkAdd try, and abort the whole backfill with the table already
+          // cleared (every lesson loses its vector). Guard the slot first.
+          if (!embeddings[j] || embeddings[j].length !== provider.dimensions) {
             failed++;
             continue;
           }
@@ -506,7 +510,10 @@ async function recallLessonVectors(
   const provider = getEmbeddingProvider();
   if (!store || !provider || store.size === 0) return [];
   try {
-    const embedding = await provider.embed(query);
+    // Clip like the write path (lessonVectorAddGuarded); an over-length query
+    // would otherwise throw inside embed() and silently disable the whole
+    // vector leg for that recall.
+    const embedding = await provider.embed(clipEmbedInput(query));
     if (embedding.length !== provider.dimensions) return [];
     // Over-fetch a little so project/confidence filtering still leaves a
     // useful number of in-scope semantic hits.

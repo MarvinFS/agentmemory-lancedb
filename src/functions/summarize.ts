@@ -50,25 +50,30 @@ const CALL_TIMEOUT_MS_DEFAULT = 45_000;
 // a clean error.
 const MAX_SKIP_RATIO = 0.5;
 
-function getChunkSize(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_SIZE;
-  if (!raw) return CHUNK_SIZE_DEFAULT;
+// Strict positive-integer env parse. parseInt() tolerates trailing units, so
+// SUMMARIZE_CALL_TIMEOUT_MS="30s" would parse to 30 (= 30ms) and silently make
+// every LLM call time out instantly into the synthetic fallback. Require a pure
+// digit string so a unit-suffixed or malformed value falls back to the default.
+function getPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return fallback;
   const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_SIZE_DEFAULT;
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function getChunkSize(): number {
+  return getPositiveIntEnv("SUMMARIZE_CHUNK_SIZE", CHUNK_SIZE_DEFAULT);
 }
 
 function getChunkConcurrency(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_CONCURRENCY;
-  if (!raw) return CHUNK_CONCURRENCY_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_CONCURRENCY_DEFAULT;
+  return getPositiveIntEnv(
+    "SUMMARIZE_CHUNK_CONCURRENCY",
+    CHUNK_CONCURRENCY_DEFAULT,
+  );
 }
 
 function getCallTimeoutMs(): number {
-  const raw = process.env.SUMMARIZE_CALL_TIMEOUT_MS;
-  if (!raw) return CALL_TIMEOUT_MS_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CALL_TIMEOUT_MS_DEFAULT;
+  return getPositiveIntEnv("SUMMARIZE_CALL_TIMEOUT_MS", CALL_TIMEOUT_MS_DEFAULT);
 }
 
 // Race a provider call against a wall-time ceiling. Resolves with the call's
@@ -463,9 +468,23 @@ function parseSummaryXml(
     source = sanitizeSummaryXml(xml);
     title = getXmlTag(source, "title");
   }
+  const narrative = getXmlTag(source, "narrative");
+  const keyDecisions = getXmlChildren(source, "decisions", "decision");
+  const filesModified = getXmlChildren(source, "files", "file");
+  const concepts = getXmlChildren(source, "concepts", "concept");
+
   if (!title) {
     title = recoverTitleFromProse(source);
     if (!title) return null;
+    // A prose-recovered title with no structured content at all is almost
+    // always a refusal or non-summary ("I'm sorry, I cannot summarize ...")
+    // rather than a thin-but-real summary. Return null so the caller retries
+    // and then salvages the chunk via the synthetic fallback (which carries
+    // the observation titles) instead of feeding the reduce step an
+    // empty-narrative partial.
+    if (!narrative && !keyDecisions.length && !filesModified.length && !concepts.length) {
+      return null;
+    }
   }
 
   return {
@@ -473,10 +492,10 @@ function parseSummaryXml(
     project,
     createdAt: new Date().toISOString(),
     title,
-    narrative: getXmlTag(source, "narrative"),
-    keyDecisions: getXmlChildren(source, "decisions", "decision"),
-    filesModified: getXmlChildren(source, "files", "file"),
-    concepts: getXmlChildren(source, "concepts", "concept"),
+    narrative,
+    keyDecisions,
+    filesModified,
+    concepts,
     observationCount: obsCount,
   };
 }

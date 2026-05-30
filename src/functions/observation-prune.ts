@@ -70,7 +70,10 @@ export function registerObservationPruneFunction(
           if (olderThanMs !== undefined) {
             if (!o.timestamp) continue;
             const age = now - new Date(o.timestamp).getTime();
-            if (age <= olderThanMs) continue;
+            // An unparseable timestamp yields NaN; treat it as "keep" rather
+            // than deleting it, so a corrupt timestamp never causes an
+            // age-bounded prune to remove a record it cannot date.
+            if (Number.isNaN(age) || age <= olderThanMs) continue;
           }
 
           if (dryRun) {
@@ -79,8 +82,26 @@ export function registerObservationPruneFunction(
             continue;
           }
 
+          // Delete + full cascade (search/vector/image-ref/audit) under one
+          // guard: a failure on any single observation logs and skips that one
+          // record instead of aborting the whole sweep (which would also skip
+          // the final flushIndexSave and leave the remaining sessions
+          // unprocessed). count/byType only advance on a fully-applied delete.
           try {
             await kv.delete(KV.observations(session.id), o.id);
+            getSearchIndex().remove(o.id);
+            await vectorIndexRemove(o.id);
+            if (o.imageData) await decrementImageRef(kv, sdk, o.imageData);
+            if (o.imageRef && o.imageRef !== o.imageData) {
+              await decrementImageRef(kv, sdk, o.imageRef);
+            }
+            await recordAudit(kv, "delete", "mem::observations-prune", [o.id], {
+              resource: "observation",
+              reason: "observation_prune",
+              type: o.type,
+              sessionId: session.id,
+              dryRun,
+            });
           } catch (err) {
             logger.warn("Observation prune delete failed", {
               resource: "observation",
@@ -90,19 +111,6 @@ export function registerObservationPruneFunction(
             });
             continue;
           }
-          getSearchIndex().remove(o.id);
-          await vectorIndexRemove(o.id);
-          if (o.imageData) await decrementImageRef(kv, sdk, o.imageData);
-          if (o.imageRef && o.imageRef !== o.imageData) {
-            await decrementImageRef(kv, sdk, o.imageRef);
-          }
-          await recordAudit(kv, "delete", "mem::observations-prune", [o.id], {
-            resource: "observation",
-            reason: "observation_prune",
-            type: o.type,
-            sessionId: session.id,
-            dryRun,
-          });
           byType[o.type] = (byType[o.type] ?? 0) + 1;
           count++;
         }

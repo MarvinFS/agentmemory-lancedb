@@ -171,11 +171,16 @@ async function recallLessons(
     })) as { success?: boolean; lessons?: Array<Lesson & { score?: number }> };
     if (!result?.success || !Array.isArray(result.lessons)) return [];
     return result.lessons
-      // Second-layer floor: even though mem::lesson-recall already drops
-      // sub-floor lexical matches, gate the smart-search bucket on the same
-      // floor so a weak lesson can never leak into a smart-search response
-      // (the stopword false positives that motivated this fix scored
-      // ~0.46-0.49 and would otherwise still surface here).
+      // Second-layer floor on the LEXICAL leg: mem::lesson-recall already drops
+      // sub-floor lexical matches, and this re-gates the smart-search bucket on
+      // the same floor as defense in depth against the stopword false positives
+      // that motivated the fix (they scored ~0.46-0.49). This floor does NOT
+      // gate pure-vector hits: their surfaced score is the cosine similarity
+      // 1/(1+distance), bounded >= ~0.333 and so always above 0.3. That is by
+      // design - Phase B intentionally surfaces semantic matches down to the
+      // ANN floor - so a future precision pass that wants to drop weak semantic
+      // hits must add a cosine-scale floor in recallLessonVectors, not raise
+      // this lexical one.
       .filter((l) => (l.score ?? l.confidence) >= LESSON_SCORE_FLOOR)
       .map((l) => ({
         lessonId: l.id,

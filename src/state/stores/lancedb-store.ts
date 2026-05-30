@@ -779,8 +779,14 @@ class LanceLessonVectorBackend implements LessonVectorBackend {
 
   async remove(lessonId: string): Promise<void> {
     const table = this.requireTable();
+    // Mirror add()'s existence check: only decrement when a row was actually
+    // removed. Removing an id with no vector row (a lesson created before the
+    // backfill, or while the embedder was down) must not drift _count below the
+    // true row count - an underflow to 0 would silently blank the vector leg
+    // (search() and recallLessonVectors short-circuit on size === 0).
+    const existed = await table.countRows(`id = ${sqlString(lessonId)}`);
     await table.delete(`id = ${sqlString(lessonId)}`);
-    if (this._count > 0) this._count -= 1;
+    if (existed > 0 && this._count > 0) this._count -= 1;
   }
 
   async search(
