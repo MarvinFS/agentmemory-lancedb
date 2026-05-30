@@ -1092,6 +1092,67 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/evict", http_method: "POST" },
   });
 
+  sdk.registerFunction("api::observations-prune",
+    async (
+      req: ApiRequest<{
+        types?: string[];
+        olderThanDays?: number;
+        dryRun?: boolean;
+      }>,
+    ): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const dryRun =
+        req.query_params?.["dryRun"] === "true" || req.body?.dryRun === true;
+      const result = await sdk.trigger({
+        function_id: "mem::observations-prune",
+        payload: { ...(req.body || {}), dryRun },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::observations-prune",
+    config: { api_path: "/agentmemory/observations/prune", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::graph-prune",
+    async (req: ApiRequest<{ dryRun?: boolean }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const dryRun =
+        req.query_params?.["dryRun"] === "true" || req.body?.dryRun === true;
+      const result = await sdk.trigger({
+        function_id: "mem::graph-prune",
+        payload: { dryRun },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-prune",
+    config: { api_path: "/agentmemory/graph/prune", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::lesson-embed-backfill",
+    async (req: ApiRequest<{ batchSize?: number }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const result = await sdk.trigger({
+        function_id: "mem::lesson-embed-backfill",
+        payload: req.body ?? {},
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::lesson-embed-backfill",
+    config: { api_path: "/agentmemory/lessons/embed-backfill", http_method: "POST" },
+  });
+
   sdk.registerFunction("api::smart-search", 
     async (
       req: ApiRequest<{ query?: string; expandIds?: string[]; limit?: number }>,

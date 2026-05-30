@@ -12,6 +12,7 @@ import {
 } from "../vector-index.js";
 import type { IndexBlobStore } from "../index-blob-store.js";
 import type { GraphKvStore } from "../graph-kv-router.js";
+import type { LessonVectorBackend } from "../lesson-vectors.js";
 
 // ---------------------------------------------------------------------------
 // LanceDB storage backend (VECTOR_BACKEND=lancedb).
@@ -105,6 +106,7 @@ interface LanceModule {
 const MEMORIES_TABLE = "memories";
 const BLOBS_TABLE = "index_blobs";
 const GRAPH_KV_TABLE = "graph_kv";
+const LESSONS_TABLE = "lessons";
 
 // Default Adaptive Knowledge Lifecycle values for a freshly-added vector.
 // Mirrors LifecycleFields; written only on a genuine insert and PRESERVED
@@ -694,6 +696,170 @@ class LanceGraphKvStore implements GraphKvStore {
       return null;
     }
   }
+}
+
+// Lessons vector table: a self-contained mirror of the memories vector path,
+// keyed on the lesson id. Lessons have their own id space (lsn_*) and the
+// memories table carries no `type` column, so a separate table is the clean
+// home for lesson vectors (per the migration design). Schema is intentionally
+// minimal — id + vector — because lessons carry their own confidence/recency
+// in KV.lessons and do NOT participate in the Adaptive Knowledge Lifecycle
+// re-rank. Reuses the exact connection / Arrow-schema / search machinery as
+// LanceVectorBackend above.
+class LanceLessonVectorBackend implements LessonVectorBackend {
+  private _count = 0;
+  private table: LanceTable | null = null;
+
+  constructor(
+    private readonly conn: LanceConnection,
+    private readonly arrow: ArrowModule,
+    private readonly dimensions: number,
+  ) {}
+
+  private buildSchema(): unknown {
+    const a = this.arrow;
+    return new a.Schema([
+      new a.Field("id", new a.Utf8(), false),
+      new a.Field(
+        "vector",
+        new a.FixedSizeList(
+          this.dimensions,
+          new a.Field("item", new a.Float32(), true),
+        ),
+        true,
+      ),
+    ]);
+  }
+
+  async init(): Promise<void> {
+    const names = await this.conn.tableNames();
+    this.table = names.includes(LESSONS_TABLE)
+      ? await this.conn.openTable(LESSONS_TABLE)
+      : await this.conn.createEmptyTable(LESSONS_TABLE, this.buildSchema());
+    this._count = await this.table.countRows();
+  }
+
+  private requireTable(): LanceTable {
+    if (!this.table) {
+      throw new Error("[agentmemory] LanceLessonVectorBackend used before init()");
+    }
+    return this.table;
+  }
+
+  // Upsert a single lesson vector. mergeInsert on "id" replaces the row on a
+  // matching id (full-row replace is correct here: the only columns are id +
+  // vector, both supplied) and inserts when absent. Unlike the memories table
+  // there are no lifecycle columns to preserve, so the simpler
+  // whenMatchedUpdateAll is safe.
+  async add(lessonId: string, embedding: Float32Array): Promise<void> {
+    const table = this.requireTable();
+    const existed = await table.countRows(`id = ${sqlString(lessonId)}`);
+    await table
+      .mergeInsert("id")
+      .whenMatchedUpdateAll()
+      .whenNotMatchedInsertAll()
+      .execute([{ id: lessonId, vector: Array.from(embedding) }]);
+    if (existed === 0) this._count += 1;
+  }
+
+  // Bulk insert assuming a prior clear() (backfill path). One on-disk commit
+  // for the whole batch instead of one Lance version per vector.
+  async bulkAdd(
+    items: Array<{ lessonId: string; embedding: Float32Array }>,
+  ): Promise<void> {
+    if (items.length === 0) return;
+    const table = this.requireTable();
+    const rows = items.map((it) => ({
+      id: it.lessonId,
+      vector: Array.from(it.embedding),
+    }));
+    await table.add(rows);
+    this._count += rows.length;
+  }
+
+  async remove(lessonId: string): Promise<void> {
+    const table = this.requireTable();
+    await table.delete(`id = ${sqlString(lessonId)}`);
+    if (this._count > 0) this._count -= 1;
+  }
+
+  async search(
+    query: Float32Array,
+    limit = 20,
+  ): Promise<Array<{ lessonId: string; score: number }>> {
+    const table = this.requireTable();
+    if (this._count === 0) return [];
+    const rows = await (table.search(Array.from(query)) as LanceVectorQuery)
+      .distanceType("cosine")
+      .limit(limit)
+      .select(["id", "_distance"])
+      .toArray();
+    return rows.map((row) => ({
+      lessonId: String(row.id),
+      score: 1 / (1 + toNumber(row._distance)),
+    }));
+  }
+
+  get size(): number {
+    return this._count;
+  }
+
+  async clear(): Promise<void> {
+    if (this.table) {
+      const names = await this.conn.tableNames();
+      if (names.includes(LESSONS_TABLE)) {
+        await this.conn.dropTable(LESSONS_TABLE);
+      }
+    }
+    this.table = await this.conn.createEmptyTable(
+      LESSONS_TABLE,
+      this.buildSchema(),
+    );
+    this._count = 0;
+  }
+
+  async optimize(): Promise<void> {
+    await this.requireTable().optimize({ cleanupOlderThan: new Date() });
+  }
+}
+
+// Additive factory: open (or create) ONLY the lessons vector table under the
+// same `${dataDir}/lancedb` directory the memories backend uses. Opens its own
+// connection — LanceDB connections are long-lived and independent per table,
+// and the lessons table has a single writer (the lesson save/backfill paths),
+// so this never races the memories connection. Returns null-free: throws with
+// the same actionable message as createLanceBackends if the native modules are
+// absent. Called by initLessonVectorStore() in lesson-vectors.ts (wired from
+// src/index.ts on the lancedb path).
+export async function createLanceLessonVectorBackend(opts: {
+  dataDir: string;
+  dimensions: number;
+}): Promise<LessonVectorBackend> {
+  let lancedb: LanceModule;
+  let arrow: ArrowModule;
+  try {
+    lancedb = (await import("@lancedb/lancedb")) as unknown as LanceModule;
+  } catch (err) {
+    throw new Error(
+      "[agentmemory] @lancedb/lancedb not installed. The lessons vector " +
+        "table requires the @lancedb/lancedb native module (an " +
+        "optionalDependency). Install it, or disable lesson embeddings. " +
+        `Underlying error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  try {
+    arrow = (await import("apache-arrow")) as unknown as ArrowModule;
+  } catch (err) {
+    throw new Error(
+      "[agentmemory] apache-arrow not installed. The lessons vector table " +
+        "requires apache-arrow (pinned 18.1.0) to build table schemas. " +
+        `Underlying error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const conn = await lancedb.connect(`${opts.dataDir}/lancedb`);
+  const backend = new LanceLessonVectorBackend(conn, arrow, opts.dimensions);
+  await backend.init();
+  return backend;
 }
 
 export async function createLanceBackends(

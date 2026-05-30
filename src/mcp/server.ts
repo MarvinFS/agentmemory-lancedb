@@ -9,6 +9,7 @@ import type {
   GraphEdge,
 } from "../types.js";
 import { getVisibleTools } from "./tools-registry.js";
+import { handleJsonRpcBody } from "./http-jsonrpc.js";
 import { timingSafeCompare } from "../auth.js";
 
 type McpResponse = {
@@ -82,7 +83,58 @@ export function registerMcpEndpoints(
       }
 
       const { name, arguments: args = {} } = req.body;
+      return dispatchToolCall(sdk, kv, name, args);
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "mcp::tools::call",
+    config: { api_path: "/agentmemory/mcp/call", http_method: "POST" },
+  });
 
+  // Always-on MCP-over-HTTP (stateless Streamable HTTP). Remote clients POST
+  // MCP JSON-RPC here and connect straight to the daemon — no per-thread stdio
+  // shim. Same Bearer auth as every other /agentmemory/mcp/* endpoint. Reuses
+  // dispatchToolCall (the SAME switch backing mcp::tools::call) and
+  // getVisibleTools, so there is zero tool-logic duplication.
+  sdk.registerFunction(
+    "mcp::http::jsonrpc",
+    async (req: ApiRequest): Promise<McpResponse> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const rpc = await handleJsonRpcBody(req.body, (name, args) =>
+        dispatchToolCall(sdk, kv, name, args),
+      );
+      // Notifications-only / single notification → 202 with no body.
+      if (rpc === null) {
+        return { status_code: 202, body: "" };
+      }
+      return {
+        status_code: 200,
+        headers: { "content-type": "application/json" },
+        body: rpc,
+      };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "mcp::http::jsonrpc",
+    config: { api_path: "/agentmemory/mcp", http_method: "POST" },
+  });
+
+  registerMcpResourcesAndPrompts(sdk, kv, secret, checkAuth);
+}
+
+// Shared tool-call dispatch backing both the REST endpoint (mcp::tools::call)
+// and the always-on JSON-RPC endpoint (mcp::http::jsonrpc). Returns the
+// REST-shaped { status_code, body } envelope; on success body is the MCP
+// { content:[...] } shape.
+async function dispatchToolCall(
+  sdk: ISdk,
+  kv: StateKV,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<McpResponse> {
       try {
         switch (name) {
           case "memory_recall": {
@@ -1261,14 +1313,14 @@ export function registerMcpEndpoints(
           },
         };
       }
-    },
-  );
-  sdk.registerTrigger({
-    type: "http",
-    function_id: "mcp::tools::call",
-    config: { api_path: "/agentmemory/mcp/call", http_method: "POST" },
-  });
+}
 
+function registerMcpResourcesAndPrompts(
+  sdk: ISdk,
+  kv: StateKV,
+  secret: string | undefined,
+  checkAuth: (req: ApiRequest, sec: string | undefined) => McpResponse | null,
+): void {
   const MCP_RESOURCES = [
     {
       uri: "agentmemory://status",

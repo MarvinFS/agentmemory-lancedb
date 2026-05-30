@@ -8,6 +8,7 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { LESSON_SCORE_FLOOR } from "./lessons.js";
 import { recordAccessBatch } from "./access-tracker.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
 import { logger } from "../logger.js";
@@ -169,18 +170,25 @@ async function recallLessons(
       payload: { query, limit, project },
     })) as { success?: boolean; lessons?: Array<Lesson & { score?: number }> };
     if (!result?.success || !Array.isArray(result.lessons)) return [];
-    return result.lessons.map((l) => ({
-      lessonId: l.id,
-      content:
-        l.content.length > LESSON_CONTENT_PREVIEW_CHARS
-          ? l.content.slice(0, LESSON_CONTENT_PREVIEW_CHARS) + "…"
-          : l.content,
-      confidence: l.confidence,
-      score: l.score ?? l.confidence,
-      createdAt: l.createdAt,
-      project: l.project,
-      tags: l.tags ?? [],
-    }));
+    return result.lessons
+      // Second-layer floor: even though mem::lesson-recall already drops
+      // sub-floor lexical matches, gate the smart-search bucket on the same
+      // floor so a weak lesson can never leak into a smart-search response
+      // (the stopword false positives that motivated this fix scored
+      // ~0.46-0.49 and would otherwise still surface here).
+      .filter((l) => (l.score ?? l.confidence) >= LESSON_SCORE_FLOOR)
+      .map((l) => ({
+        lessonId: l.id,
+        content:
+          l.content.length > LESSON_CONTENT_PREVIEW_CHARS
+            ? l.content.slice(0, LESSON_CONTENT_PREVIEW_CHARS) + "…"
+            : l.content,
+        confidence: l.confidence,
+        score: l.score ?? l.confidence,
+        createdAt: l.createdAt,
+        project: l.project,
+        tags: l.tags ?? [],
+      }));
   } catch (err) {
     logger.warn("Smart search: mem::lesson-recall failed; returning empty lesson list", {
       error: err instanceof Error ? err.message : String(err),

@@ -88,6 +88,9 @@ import { registerDiagnosticsFunction } from "./functions/diagnostics.js";
 import { registerFacetsFunction } from "./functions/facets.js";
 import { registerVerifyFunction } from "./functions/verify.js";
 import { registerCascadeFunction } from "./functions/cascade.js";
+import { registerObservationPruneFunction } from "./functions/observation-prune.js";
+import { registerGraphPruneFunction } from "./functions/graph-prune.js";
+import { initLessonVectorStore } from "./state/lesson-vectors.js";
 import { registerLessonsFunctions } from "./functions/lessons.js";
 import { registerObsidianExportFunction } from "./functions/obsidian-export.js";
 import { registerReflectFunctions } from "./functions/reflect.js";
@@ -277,6 +280,14 @@ async function main() {
   setVectorIndex(vectorIndex);
   setEmbeddingProvider(embeddingProvider);
 
+  if (embeddingProvider) {
+    await initLessonVectorStore({
+      dataDir: config.dataDir,
+      dimensions: embeddingProvider.dimensions,
+      backend: getVectorBackendKind(),
+    });
+  }
+
   const meterAccessor = hasGetMeter(sdk)
     ? (sdk.getMeter.bind(sdk) as (name: string) => unknown)
     : undefined;
@@ -301,6 +312,7 @@ async function main() {
   registerPatternsFunction(sdk, kv);
   registerRememberFunction(sdk, kv);
   registerEvictFunction(sdk, kv);
+  registerObservationPruneFunction(sdk, kv);
 
   registerRelationsFunction(sdk, kv);
   registerTimelineFunction(sdk, kv);
@@ -376,6 +388,7 @@ async function main() {
   registerWorkingMemoryFunctions(sdk, kv, config.tokenBudget);
   registerSkillExtractFunctions(sdk, kv, provider);
   registerCascadeFunction(sdk, kv);
+  registerGraphPruneFunction(sdk, kv);
 
   registerSlidingWindowFunction(sdk, kv, provider);
   registerQueryExpansionFunction(sdk, provider);

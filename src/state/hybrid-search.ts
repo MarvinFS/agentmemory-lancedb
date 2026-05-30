@@ -16,6 +16,7 @@ import {
 } from "../functions/graph-retrieval.js";
 import { extractEntitiesFromQuery } from "../functions/query-expansion.js";
 import { rerank } from "./reranker.js";
+import { isBreadcrumbType } from "../functions/compress-synthetic.js";
 import {
   applyDecay,
   compoundScore,
@@ -270,7 +271,16 @@ export class HybridSearch {
     if (this.vector && enriched.length > 0 && lifecycle.size > 0) {
       const vector = this.vector;
       const now = Date.now();
-      const reinforceIds = enriched.map((e) => e.observation.id);
+      // Reinforce curated knowledge only. Breadcrumb observations (file
+      // reads/edits, searches, command runs, etc.) are intentionally NOT
+      // reinforced on recall: bumping their importance + promoting their
+      // maturity tier would pull high-volume, low-signal noise into the
+      // tierBoost tiers and keep it from ever aging out. Gating strictly by
+      // ObservationType lets curated memories and high-signal types
+      // (decision/discovery/image) keep climbing while breadcrumbs decay.
+      const reinforceIds = enriched
+        .filter((e) => !isBreadcrumbType(e.observation.type))
+        .map((e) => e.observation.id);
       // Reuse the lifecycle records already fetched for the re-rank above
       // instead of a second getLifecycle round-trip for a subset of the same
       // ids. The map holds the raw, un-decayed records reinforceOnAccess
