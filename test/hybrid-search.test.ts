@@ -143,6 +143,39 @@ describe("HybridSearch", () => {
     expect(results).toEqual([]);
   });
 
+  it("down-weights breadcrumb observations below curated content", async () => {
+    // The breadcrumb is the STRONGER lexical match (more "auth" tokens) so
+    // BM25 ranks it first. The breadcrumb penalty must still demote it below
+    // the curated decision memory that matches less strongly.
+    const breadcrumb = makeObs({
+      id: "bc",
+      sessionId: "ses_1",
+      type: "file_read",
+      title: "auth auth auth",
+      subtitle: "auth",
+      narrative: "auth auth auth auth auth",
+      concepts: ["auth"],
+    });
+    const curated = makeObs({
+      id: "cur",
+      sessionId: "ses_1",
+      type: "decision",
+      title: "auth strategy decision",
+      subtitle: "",
+      narrative: "auth",
+      concepts: ["auth"],
+    });
+    bm25.add(breadcrumb);
+    bm25.add(curated);
+    await kv.set("mem:obs:ses_1", "bc", breadcrumb);
+    await kv.set("mem:obs:ses_1", "cur", curated);
+
+    const hybrid = new HybridSearch(bm25, null, null, kv as never);
+    const results = await hybrid.search("auth");
+
+    expect(results.map((r) => r.observation.id)).toEqual(["cur", "bc"]);
+  });
+
   it("falls back to KV.memories when an indexed entry is a saved memory (#265)", async () => {
     // mem::remember writes to KV.memories under the synthetic sessionId
     // "memory" — the BM25 index sees that synthetic sessionId, but

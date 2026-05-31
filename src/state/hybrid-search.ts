@@ -27,6 +27,18 @@ import type { LifecycleFields } from "./vector-index.js";
 
 const RRF_K = 60;
 
+// Multiplicative penalty applied to breadcrumb observations' combinedScore so
+// curated knowledge ranks above auto-captured tool-call records (file reads/
+// edits, command runs, searches, etc.) of comparable relevance. Down-weight,
+// not filter: a strongly-matching breadcrumb can still surface, just below
+// curated content. 1 disables the penalty; default 0.5. Tunable via
+// AGENTMEMORY_BREADCRUMB_PENALTY (clamped to [0, 1]).
+const BREADCRUMB_PENALTY = (() => {
+  const raw = process.env.AGENTMEMORY_BREADCRUMB_PENALTY;
+  const n = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.5;
+})();
+
 export class HybridSearch {
   private graphRetrieval: GraphRetrieval;
 
@@ -261,6 +273,20 @@ export class HybridSearch {
     const rerankWindow = 20;
     const diversified = this.diversifyBySession(combined, retrievalDepth);
     const enriched = await this.enrichResults(diversified, retrievalDepth);
+
+    // --- Breadcrumb down-weight ---
+    // Observation type is only known after enrichResults loads the rows, so we
+    // apply the breadcrumb penalty here and re-sort. This demotes breadcrumbs
+    // below curated knowledge of comparable relevance for every consumer of
+    // hybrid search (memory_recall via mem::search, and memory_smart_search).
+    if (BREADCRUMB_PENALTY < 1) {
+      for (const e of enriched) {
+        if (isBreadcrumbType(e.observation.type)) {
+          e.combinedScore *= BREADCRUMB_PENALTY;
+        }
+      }
+      enriched.sort((a, b) => b.combinedScore - a.combinedScore);
+    }
 
     // --- Best-effort access reinforcement (fire-and-forget) ---
     // Bump the lifecycle of the observations we are about to return so
