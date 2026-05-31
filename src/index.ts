@@ -14,6 +14,7 @@ import {
   isDropStaleIndexEnabled,
   getVectorBackendKind,
 } from "./config.js";
+import { loadSystemdCredentials } from "./load-credentials.js";
 import {
   createProvider,
   createFallbackProvider,
@@ -173,6 +174,12 @@ process.on("unhandledRejection", (reason) => {
 });
 
 async function main() {
+  // Pull any systemd-delivered secrets ($CREDENTIALS_DIRECTORY) into the
+  // environment before config/providers read keys. Runs here in the worker
+  // (whether in-process under cli.mjs or as the iii-exec'd dist/index.mjs)
+  // so the values populate this process's env at runtime without ever
+  // entering the exec environ block / /proc/<pid>/environ.
+  loadSystemdCredentials();
   const config = loadConfig();
   const embeddingConfig = loadEmbeddingConfig();
   const fallbackConfig = loadFallbackConfig();
