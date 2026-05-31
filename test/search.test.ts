@@ -4,7 +4,7 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerSearchFunction, getSearchIndex, rebuildIndex, setVectorIndex, setEmbeddingProvider, getVectorIndex } from "../src/functions/search.js";
+import { registerSearchFunction, getSearchIndex, rebuildIndex, setVectorIndex, setEmbeddingProvider, getVectorIndex, setHybridSearcher } from "../src/functions/search.js";
 import { VectorIndex, MemoryVectorIndex } from "../src/state/vector-index.js";
 import { KV } from "../src/state/schema.js";
 import type { CompressedObservation, Session } from "../src/types.js";
@@ -204,5 +204,39 @@ describe("mem::search", () => {
     // Cleanup
     setVectorIndex(null);
     setEmbeddingProvider(null);
+  });
+
+  it("routes through the injected hybrid searcher and preserves one-call full bodies", async () => {
+    const obsA = (await kv.get(KV.observations("ses_1"), "obs_a")) as CompressedObservation;
+    const obsB = (await kv.get(KV.observations("ses_1"), "obs_b")) as CompressedObservation;
+    // Hybrid ranks obs_b above obs_a — the OPPOSITE of BM25 lexical relevance
+    // for "auth middleware" (only obs_a matches those terms). Proves the order
+    // comes from the hybrid searcher, not the BM25 index.
+    setHybridSearcher(async () => [
+      { observation: obsB, sessionId: "ses_1", bm25Score: 0, vectorScore: 1, graphScore: 0, combinedScore: 0.9 },
+      { observation: obsA, sessionId: "ses_1", bm25Score: 1, vectorScore: 0, graphScore: 0, combinedScore: 0.1 },
+    ]);
+    try {
+      const result = (await sdk.trigger("mem::search", {
+        query: "auth middleware",
+      })) as { results: Array<{ observation: CompressedObservation }> };
+
+      expect(result.results.map((r) => r.observation.id)).toEqual(["obs_b", "obs_a"]);
+      // full format still carries the bodies in the same single call
+      const a = result.results.find((r) => r.observation.id === "obs_a")!;
+      expect(a.observation.narrative).toContain("JWT");
+      expect(a.observation.facts).toContain("Use rotating refresh tokens");
+    } finally {
+      setHybridSearcher(null);
+    }
+  });
+
+  it("falls back to BM25 ranking when no hybrid searcher is wired", async () => {
+    setHybridSearcher(null);
+    const result = (await sdk.trigger("mem::search", {
+      query: "auth middleware",
+    })) as { results: Array<{ observation: CompressedObservation }> };
+    // Only obs_a matches "auth middleware" lexically; BM25 returns just it.
+    expect(result.results.map((r) => r.observation.id)).toEqual(["obs_a"]);
   });
 });

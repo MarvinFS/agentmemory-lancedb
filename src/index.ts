@@ -44,6 +44,7 @@ import { registerDiskSizeManager } from "./functions/disk-size-manager.js";
 import { registerCompressFunction } from "./functions/compress.js";
 import {
   registerSearchFunction,
+  setHybridSearcher,
   rebuildIndex,
   getSearchIndex,
   setVectorIndex,
@@ -428,6 +429,12 @@ async function main() {
     embeddingConfig.vectorWeight,
     graphWeight,
   );
+
+  // Route mem::search (memory_recall) through the same hybrid searcher so the
+  // mandated recall tool gets BM25 + vector + graph + lifecycle ranking with
+  // one-call full bodies, instead of bare BM25. Lazy wiring: registerSearchFunction
+  // ran earlier, before hybridSearch existed.
+  setHybridSearcher((query, limit) => hybridSearch.search(query, limit));
 
   registerSmartSearchFunction(sdk, kv, (query, limit) =>
     hybridSearch.search(query, limit),

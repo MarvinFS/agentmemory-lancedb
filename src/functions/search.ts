@@ -1,5 +1,5 @@
 import type { ISdk } from 'iii-sdk'
-import type { CompactSearchResult, CompressedObservation, Memory, SearchResult, Session } from '../types.js'
+import type { CompactSearchResult, CompressedObservation, HybridSearchResult, Memory, SearchResult, Session } from '../types.js'
 import { KV } from '../state/schema.js'
 import { StateKV } from '../state/kv.js'
 import { SearchIndex } from '../state/search-index.js'
@@ -337,6 +337,22 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
   return count
 }
 
+// Optional hybrid searcher, wired lazily from index.ts after HybridSearch is
+// constructed (mirrors the setIndexPersistence pattern - registerSearchFunction
+// runs before hybridSearch exists). When set, mem::search retrieves and ranks
+// via the full hybrid path (BM25 + vector + graph + lifecycle + breadcrumb
+// down-weight) instead of bare BM25, while keeping its one-call full/compact/
+// narrative formatter. Falls back to BM25 when unset (in-memory backend, or
+// before wiring) so behavior is preserved.
+let hybridSearcher:
+  | ((query: string, limit: number) => Promise<HybridSearchResult[]>)
+  | null = null
+export function setHybridSearcher(
+  fn: ((query: string, limit: number) => Promise<HybridSearchResult[]>) | null,
+): void {
+  hybridSearcher = fn
+}
+
 export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     'mem::search',
@@ -386,7 +402,20 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
       // post-filter still has a chance of returning `effectiveLimit` results.
       const filtering = !!(projectFilter || cwdFilter)
       const fetchLimit = filtering ? Math.max(effectiveLimit * 10, 100) : effectiveLimit
-      const results = idx.search(query, fetchLimit)
+      let results: Array<{ obsId: string; sessionId: string; score: number }>
+      if (hybridSearcher) {
+        // Full hybrid retrieval + ranking. The hybrid path loads observations
+        // internally, but we keep the existing reload below so the project/cwd
+        // filter and the KV.memories fallback (#265) stay on one code path.
+        const hybridResults = await hybridSearcher(query, fetchLimit)
+        results = hybridResults.map((r) => ({
+          obsId: r.observation.id,
+          sessionId: r.sessionId,
+          score: r.combinedScore,
+        }))
+      } else {
+        results = idx.search(query, fetchLimit)
+      }
 
       // Resolve session -> project/cwd once per sessionId we touch.
       const sessionCache = new Map<string, Session | null>()
