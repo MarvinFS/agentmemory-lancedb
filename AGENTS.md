@@ -7,6 +7,7 @@ agentmemory is a persistent memory system for AI coding agents, built on iii-eng
 - **Engine**: iii-sdk (WebSocket to iii-engine on port 49134)
 - **State**: File-based SQLite via iii-engine's StateModule (`./data/state_store.db`)
 - **Build**: TypeScript → ESM via tsdown, output to `dist/`
+- **Build safety**: stop the daemon before rebuilding in the live deploy dir — `systemctl stop agentmemory && npm run build && systemctl start agentmemory`. `tsdown clean:true` transiently removes `dist/iii-config.yaml`, which the running iii engine hot-reloads, so an in-place rebuild crash-loops the engine (exit code=1) and 502s recall until a full restart.
 - **Test**: vitest (`npm test` excludes integration tests)
 
 ## Consistency Rules
