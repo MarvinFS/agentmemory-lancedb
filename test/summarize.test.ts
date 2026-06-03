@@ -467,7 +467,7 @@ describe("mem::summarize chunking", () => {
     expect((provider as any).calls.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("returns parse_failed only after both attempts fail", async () => {
+  it("salvages a synthetic summary after both summarize attempts fail to parse", async () => {
     const provider = makeProvider([
       "garbage one",
       "garbage two",
@@ -480,7 +480,11 @@ describe("mem::summarize chunking", () => {
 
     const result: any = await handler({ sessionId: "ses_fail" });
 
-    expect(result.success).toBe(false);
-    expect(result.error).toBe("parse_failed");
+    // Fork behavior (vs upstream's parse_failed): the single-call path retries
+    // the LLM once, then degrades to a zero-LLM synthetic summary built from the
+    // observation titles rather than dropping the session — partial beats none.
+    expect(result.success).toBe(true);
+    expect(result.summary.title).toContain("Session activity");
+    expect((provider as any).calls.length).toBeGreaterThanOrEqual(2);
   });
 });

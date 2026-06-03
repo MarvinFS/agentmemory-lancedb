@@ -161,23 +161,30 @@ async function produceSummaryXml(
   const chunkSize = getChunkSize();
   const callTimeoutMs = getCallTimeoutMs();
   if (compressed.length <= chunkSize) {
-    try {
-      const response = await withCallTimeout(
-        () => provider.summarize(SUMMARY_SYSTEM, buildSummaryPrompt(compressed)),
-        callTimeoutMs,
-      );
-      if (response && response.trim() && parseSummaryXml(response, sessionId, project, compressed.length)) {
-        return { response, mode: "single", chunks: 1 };
+    // Retry the single LLM call once before degrading: a markdown-wrapped or
+    // otherwise unparseable first response gets a second roll of the dice
+    // (upstream #783) before we fall back to the zero-LLM synthetic summary.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const response = await withCallTimeout(
+          () => provider.summarize(SUMMARY_SYSTEM, buildSummaryPrompt(compressed)),
+          callTimeoutMs,
+        );
+        if (response && response.trim() && parseSummaryXml(response, sessionId, project, compressed.length)) {
+          return { response, mode: "single", chunks: 1 };
+        }
+        logger.warn("Summarize single-call empty/unparseable", {
+          sessionId,
+          observationCount: compressed.length,
+          attempt,
+        });
+      } catch (err) {
+        logger.warn("Summarize single-call failed", {
+          sessionId,
+          attempt,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
-      logger.warn("Summarize single-call empty/unparseable, using synthetic fallback", {
-        sessionId,
-        observationCount: compressed.length,
-      });
-    } catch (err) {
-      logger.warn("Summarize single-call failed, using synthetic fallback", {
-        sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
     }
     // Single LLM call timed out / failed / produced no usable XML. Salvage the
     // session with a zero-LLM synthetic summary instead of returning a hard
