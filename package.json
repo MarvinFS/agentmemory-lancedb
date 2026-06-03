@@ -1,6 +1,6 @@
 {
   "name": "@agentmemory/agentmemory",
-  "version": "0.9.24",
+  "version": "0.9.25",
   "description": "Persistent memory for AI coding agents, powered by iii-engine's three primitives",
   "type": "module",
   "main": "dist/index.mjs",
@@ -75,11 +75,16 @@
     "tiny-segmenter": "^0.2.0"
   },
   "devDependencies": {
-    "@types/node": "^25.7.0",
+    "@types/node": "^25.9.1",
     "tsdown": "^0.22.1",
     "tsx": "^4.19.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.6"
+  },
+  "overrides": {
+    "qs": "^6.15.2",
+    "ws": "^8.21.0",
+    "protobufjs": "^7.5.8"
   },
   "engines": {
     "node": ">=20.0.0"

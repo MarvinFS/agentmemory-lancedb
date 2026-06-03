@@ -556,41 +556,59 @@ export function registerSummarizeFunction(
       }
 
       try {
-        const { response, mode, chunks } = await produceSummaryXml(
-          provider,
-          compressed,
-          sessionId,
-          session.project,
-        );
+        // #783: chunk-level produceSummaryXml retries internally, but
+        // the final merge used to parse once and bail. Wrap the
+        // produce-and-parse pair in the same 2-attempt loop so a
+        // markdown-wrapped or otherwise wrapped response gets a
+        // second roll-of-the-dice instead of dropping the summary.
+        let summary: SessionSummary | null = null;
+        let response = "";
+        let mode = "single";
+        let chunks = 1;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const produced = await produceSummaryXml(
+            provider,
+            compressed,
+            sessionId,
+            session.project,
+          );
+          response = produced.response;
+          mode = produced.mode;
+          chunks = produced.chunks;
+          if (!response || !response.trim()) {
+            logger.warn("Empty provider response on summarize", {
+              sessionId,
+              provider: provider.name,
+              mode,
+              chunks,
+              observationCount: compressed.length,
+              attempt,
+            });
+            continue;
+          }
+          summary = parseSummaryXml(
+            response,
+            sessionId,
+            session.project,
+            compressed.length,
+          );
+          if (summary) break;
+          logger.warn("Failed to parse summary XML", { sessionId, attempt });
+        }
+
         if (!response || !response.trim()) {
           const latencyMs = Date.now() - startMs;
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
-          logger.warn("Empty provider response on summarize", {
-            sessionId,
-            provider: provider.name,
-            mode,
-            chunks,
-            observationCount: compressed.length,
-          });
           return { success: false, error: "empty_provider_response" };
         }
-        const summary = parseSummaryXml(
-          response,
-          sessionId,
-          session.project,
-          compressed.length,
-        );
 
         if (!summary) {
           const latencyMs = Date.now() - startMs;
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
-          logger.warn("Failed to parse summary XML", {
-            sessionId,
-          });
           return { success: false, error: "parse_failed" };
         }
 

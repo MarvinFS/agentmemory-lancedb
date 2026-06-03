@@ -64,6 +64,7 @@ import { registerEvictFunction } from "./functions/evict.js";
 import { registerRelationsFunction } from "./functions/relations.js";
 import { registerTimelineFunction } from "./functions/timeline.js";
 import { registerSmartSearchFunction } from "./functions/smart-search.js";
+import { registerRecentSearchesSweepFunction } from "./functions/recent-searches-sweep.js";
 import { registerProfileFunction } from "./functions/profile.js";
 import { registerAutoForgetFunction } from "./functions/auto-forget.js";
 import { registerExportImportFunction } from "./functions/export-import.js";
@@ -446,6 +447,7 @@ async function main() {
   registerSmartSearchFunction(sdk, kv, (query, limit) =>
     hybridSearch.search(query, limit),
   );
+  registerRecentSearchesSweepFunction(sdk, kv);
 
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
@@ -683,6 +685,20 @@ async function main() {
     }, 86400000);
     insightDecayTimer.unref();
   }
+
+  // #771: hourly TTL sweep for the followup-rate diagnostic. The
+  // recent-searches scope only needs the last entry per session;
+  // sweeping anything older than the retention window keeps the scope
+  // from growing unbounded across long-lived deployments.
+  const recentSearchesSweepTimer = setInterval(async () => {
+    try {
+      await sdk.trigger({
+        function_id: "mem::diagnostic::recent-searches-sweep",
+        payload: {},
+      });
+    } catch {}
+  }, 60 * 60 * 1000);
+  recentSearchesSweepTimer.unref();
 
   if (isConsolidationEnabled()) {
     const consolidationTimer = setInterval(async () => {
