@@ -1,6 +1,6 @@
 import type { StateKV } from "./kv.js";
 import { VectorIndex, MemoryVectorIndex, type VectorBackend } from "./vector-index.js";
-import { KvIndexBlobStore, type IndexBlobStore } from "./index-blob-store.js";
+import type { IndexBlobStore } from "./index-blob-store.js";
 import type { GraphKvStore } from "./graph-kv-router.js";
 
 // Pluggable vector-store selector (upstream PR #300's VECTOR_BACKEND env).
@@ -12,7 +12,10 @@ export type VectorBackendKind = "memory" | "lancedb" | "sqlite-vec" | "iii";
 
 export interface PersistenceBackends {
   vector: VectorIndex;
-  blobStore: IndexBlobStore;
+  // Present only for self-persisting backends (lancedb), which route the
+  // BM25 blob onto their own on-disk store. Absent for memory/iii, where
+  // BM25 goes through the upstream sharded IndexPersistence path in iii KV.
+  blobStore?: IndexBlobStore;
   // Present only when the backend owns its own files (lancedb): the knowledge
   // graph's KV scopes are routed here instead of the iii engine KV. Undefined
   // for the memory backend, where the graph stays in iii KV.
@@ -26,11 +29,11 @@ export interface CreateBackendsOptions {
   backend: VectorBackendKind;
 }
 
-// Builds the vector index AND the BM25 blob store together, because a
-// self-persisting backend (lancedb) shares one on-disk connection across
-// both. Called only when an embedding provider is configured; with no
-// provider there are no vectors and BM25 stays in the iii KV
-// (KvIndexBlobStore), wired directly in src/index.ts.
+// Builds the vector index, and for lancedb the BM25 blob store too, because
+// that self-persisting backend shares one on-disk connection across both.
+// Called only when an embedding provider is configured. The memory branch
+// returns no blobStore — BM25 then routes through the upstream sharded
+// IndexPersistence path in the iii KV (wired in src/index.ts).
 export async function createPersistenceBackends(
   opts: CreateBackendsOptions,
 ): Promise<PersistenceBackends> {
@@ -56,7 +59,6 @@ export async function createPersistenceBackends(
       if (backend.init) await backend.init();
       return {
         vector: new VectorIndex(backend),
-        blobStore: new KvIndexBlobStore(opts.kv),
       };
     }
   }

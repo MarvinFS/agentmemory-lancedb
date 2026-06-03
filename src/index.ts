@@ -30,10 +30,7 @@ import {
   backfillGraphIfEmpty,
   type GraphKvStore,
 } from "./state/graph-kv-router.js";
-import {
-  KvIndexBlobStore,
-  type IndexBlobStore,
-} from "./state/index-blob-store.js";
+import type { IndexBlobStore } from "./state/index-blob-store.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
@@ -249,7 +246,7 @@ async function main() {
   // in the iii KV. createPersistenceBackends opens lancedb's tables and caches
   // its row count before returning, so VectorIndex.size is valid at boot below.
   let vectorIndex: VectorIndex | null = null;
-  let indexBlobStore: IndexBlobStore;
+  let indexBlobStore: IndexBlobStore | undefined;
   let graphKv: GraphKvStore | undefined;
   if (embeddingProvider) {
     const backends = await createPersistenceBackends({
@@ -261,8 +258,6 @@ async function main() {
     vectorIndex = backends.vector;
     indexBlobStore = backends.blobStore;
     graphKv = backends.graphKv;
-  } else {
-    indexBlobStore = new KvIndexBlobStore(baseKv);
   }
 
   // When a self-persisting backend owns its files (lancedb), route the graph's
@@ -455,11 +450,13 @@ async function main() {
 
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
-  const indexPersistence = new IndexPersistence(
-    indexBlobStore,
-    bm25Index,
-    vectorIndex,
-  );
+  // lancedb (persistsExternally) injects its on-disk blob store; every other
+  // backend uses upstream's sharded IndexPersistence in the iii KV. vectorIndex
+  // is null when no embedding provider is configured — that also takes the
+  // sharded path (no vectors, BM25 self-migrates from the legacy "data" key).
+  const indexPersistence = vectorIndex?.persistsExternally
+    ? new IndexPersistence(baseKv, bm25Index, vectorIndex, {}, indexBlobStore)
+    : new IndexPersistence(baseKv, bm25Index, vectorIndex);
   // Wire the persistence hook so delete paths can flush BM25/vector
   // index mutations to disk. Without this, an in-memory remove can be
   // lost across a hard process exit and the persisted snapshot
