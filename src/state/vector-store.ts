@@ -2,6 +2,7 @@ import type { StateKV } from "./kv.js";
 import { VectorIndex, MemoryVectorIndex, type VectorBackend } from "./vector-index.js";
 import type { IndexBlobStore } from "./index-blob-store.js";
 import type { GraphKvStore } from "./graph-kv-router.js";
+import type { ContentKvStore } from "./content-kv-router.js";
 
 // Pluggable vector-store selector (upstream PR #300's VECTOR_BACKEND env).
 //   memory     - in-memory Map + brute-force cosine (default; tests + standalone)
@@ -20,6 +21,11 @@ export interface PersistenceBackends {
   // graph's KV scopes are routed here instead of the iii engine KV. Undefined
   // for the memory backend, where the graph stays in iii KV.
   graphKv?: GraphKvStore;
+  // Present only when the backend owns its own files (lancedb): the write-
+  // through home for memory/observation/session/summary CONTENT, routed here
+  // out of the lazy iii KV so every save is durable across a kill -9. Undefined
+  // for the memory backend, where content stays in iii KV.
+  contentKv?: ContentKvStore;
 }
 
 export interface CreateBackendsOptions {

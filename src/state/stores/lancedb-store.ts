@@ -12,6 +12,13 @@ import {
 } from "../vector-index.js";
 import type { IndexBlobStore } from "../index-blob-store.js";
 import type { GraphKvStore } from "../graph-kv-router.js";
+import {
+  CONTENT_TOMBSTONE,
+  type ContentKvStore,
+  type ContentRawGet,
+  type ContentRawRow,
+} from "../content-kv-router.js";
+import { withKeyedLock } from "../keyed-mutex.js";
 import type { LessonVectorBackend } from "../lesson-vectors.js";
 
 // ---------------------------------------------------------------------------
@@ -106,6 +113,10 @@ interface LanceModule {
 const MEMORIES_TABLE = "memories";
 const BLOBS_TABLE = "index_blobs";
 const GRAPH_KV_TABLE = "graph_kv";
+const CONTENT_KV_TABLE = "content_kv";
+// One keyed-mutex lock serializing every content_kv write/delete/backfill batch
+// against optimize(), so a compaction never overlaps an in-flight merge.
+const CONTENT_KV_LOCK = "content_kv";
 const LESSONS_TABLE = "lessons";
 
 // Default Adaptive Knowledge Lifecycle values for a freshly-added vector.
@@ -698,6 +709,197 @@ class LanceGraphKvStore implements GraphKvStore {
   }
 }
 
+// Content KV backend: the write-through home for memory/observation/session/
+// summary CONTENT, finishing the migration the graph already made. Same
+// (scope, key, value) table shape as graph_kv, with two additions: the
+// composite identity is the collision-safe JSON array `[scope,key]` (content
+// keys are less constrained than graph ids), and a delete writes a durable
+// TOMBSTONE (value = CONTENT_TOMBSTONE) rather than hard-removing, so a stale
+// iii copy can never resurrect a post-cutover delete. Every mutation is
+// serialized on one keyed-mutex lock against optimize().
+class LanceContentKvStore implements ContentKvStore {
+  private table: LanceTable | null = null;
+
+  constructor(
+    private readonly conn: LanceConnection,
+    private readonly arrow: ArrowModule,
+  ) {}
+
+  private buildSchema(): unknown {
+    const a = this.arrow;
+    return new a.Schema([
+      new a.Field("pk", new a.Utf8(), false),
+      new a.Field("scope", new a.Utf8(), false),
+      new a.Field("key", new a.Utf8(), false),
+      new a.Field("value", new a.Utf8(), true),
+    ]);
+  }
+
+  async init(): Promise<void> {
+    const names = await this.conn.tableNames();
+    this.table = names.includes(CONTENT_KV_TABLE)
+      ? await this.conn.openTable(CONTENT_KV_TABLE)
+      : await this.conn.createEmptyTable(CONTENT_KV_TABLE, this.buildSchema());
+  }
+
+  private requireTable(): LanceTable {
+    if (!this.table) {
+      throw new Error("[agentmemory] LanceContentKvStore used before init()");
+    }
+    return this.table;
+  }
+
+  // Collision-safe composite identity. Two distinct (scope,key) pairs can never
+  // encode to the same JSON array literal, so this is the mergeInsert/delete
+  // match identity; the `key` column is only a secondary lookup index used by
+  // findByKey for bare-obsId resolution.
+  private pk(scope: string, key: string): string {
+    return JSON.stringify([scope, key]);
+  }
+
+  private decode<T>(raw: unknown): { deleted: boolean; value: T | null } {
+    if (typeof raw !== "string") return { deleted: false, value: null };
+    if (raw === CONTENT_TOMBSTONE) return { deleted: true, value: null };
+    try {
+      return { deleted: false, value: JSON.parse(raw) as T };
+    } catch {
+      return { deleted: false, value: null };
+    }
+  }
+
+  async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
+    const row = {
+      pk: this.pk(scope, key),
+      scope,
+      key,
+      value: JSON.stringify(value),
+    };
+    await withKeyedLock(CONTENT_KV_LOCK, async () => {
+      await this.requireTable()
+        .mergeInsert("pk")
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute([row]);
+    });
+    return value;
+  }
+
+  async get<T = unknown>(scope: string, key: string): Promise<T | null> {
+    const raw = await this.getRaw<T>(scope, key);
+    return raw.deleted ? null : raw.value;
+  }
+
+  async getRaw<T = unknown>(scope: string, key: string): Promise<ContentRawGet<T>> {
+    const rows = await this.requireTable()
+      .query()
+      .where(`scope = ${sqlString(scope)} AND key = ${sqlString(key)}`)
+      .select(["value"])
+      .limit(1)
+      .toArray();
+    if (rows.length === 0) return { found: false, deleted: false, value: null };
+    const { deleted, value } = this.decode<T>(rows[0].value);
+    return { found: true, deleted, value };
+  }
+
+  async delete(scope: string, key: string): Promise<void> {
+    const row = {
+      pk: this.pk(scope, key),
+      scope,
+      key,
+      value: CONTENT_TOMBSTONE,
+    };
+    await withKeyedLock(CONTENT_KV_LOCK, async () => {
+      // Tombstone, not a hard remove (see class comment).
+      await this.requireTable()
+        .mergeInsert("pk")
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute([row]);
+    });
+  }
+
+  async list<T = unknown>(scope: string): Promise<T[]> {
+    const rows = await this.requireTable()
+      .query()
+      .where(`scope = ${sqlString(scope)}`)
+      .select(["value"])
+      .toArray();
+    const out: T[] = [];
+    for (const r of rows) {
+      const { deleted, value } = this.decode<T>(r.value);
+      if (!deleted && value !== null) out.push(value);
+    }
+    return out;
+  }
+
+  async listRaw<T = unknown>(scope: string): Promise<Array<ContentRawRow<T>>> {
+    const rows = await this.requireTable()
+      .query()
+      .where(`scope = ${sqlString(scope)}`)
+      .select(["key", "value"])
+      .toArray();
+    const out: Array<ContentRawRow<T>> = [];
+    for (const r of rows) {
+      const { deleted, value } = this.decode<T>(r.value);
+      out.push({ key: String(r.key), value, deleted });
+    }
+    return out;
+  }
+
+  async findByKey<T = unknown>(
+    key: string,
+    scopeExact: string[],
+    scopePrefixes: string[],
+  ): Promise<{ scope: string; value: T } | null> {
+    const rows = await this.requireTable()
+      .query()
+      .where(`key = ${sqlString(key)}`)
+      .select(["scope", "value"])
+      .toArray();
+    for (const r of rows) {
+      const scope = String(r.scope);
+      const match =
+        scopeExact.includes(scope) || scopePrefixes.some((p) => scope.startsWith(p));
+      if (!match) continue;
+      const { deleted, value } = this.decode<T>(r.value);
+      if (!deleted && value !== null) return { scope, value };
+    }
+    return null;
+  }
+
+  async bulkInsertIfAbsent(
+    rows: Array<{ scope: string; key: string; value: unknown }>,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    const payload = rows.map((r) => ({
+      pk: this.pk(r.scope, r.key),
+      scope: r.scope,
+      key: r.key,
+      value: JSON.stringify(r.value),
+    }));
+    await withKeyedLock(CONTENT_KV_LOCK, async () => {
+      // Insert-only: a pk that already exists (a newer write OR a tombstone) is
+      // preserved, never overwritten by stale iii data. No whenMatched clause.
+      await this.requireTable()
+        .mergeInsert("pk")
+        .whenNotMatchedInsertAll()
+        .execute(payload);
+    });
+  }
+
+  async countScope(scope: string): Promise<number> {
+    return this.requireTable().countRows(
+      `scope = ${sqlString(scope)} AND value != ${sqlString(CONTENT_TOMBSTONE)}`,
+    );
+  }
+
+  async optimize(): Promise<void> {
+    await withKeyedLock(CONTENT_KV_LOCK, async () => {
+      await this.requireTable().optimize({ cleanupOlderThan: new Date() });
+    });
+  }
+}
+
 // Lessons vector table: a self-contained mirror of the memories vector path,
 // keyed on the lesson id. Lessons have their own id space (lsn_*) and the
 // memories table carries no `type` column, so a separate table is the clean
@@ -909,9 +1111,13 @@ export async function createLanceBackends(
   const graphKv = new LanceGraphKvStore(conn, arrow);
   await graphKv.init();
 
+  const contentKv = new LanceContentKvStore(conn, arrow);
+  await contentKv.init();
+
   return {
     vector: new VectorIndex(vectorBackend),
     blobStore,
     graphKv,
+    contentKv,
   };
 }

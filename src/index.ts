@@ -27,10 +27,16 @@ import { memoryToObservation } from "./state/memory-utils.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { createPersistenceBackends } from "./state/vector-store.js";
 import {
-  GraphRoutingKV,
   backfillGraphIfEmpty,
   type GraphKvStore,
 } from "./state/graph-kv-router.js";
+import {
+  ScopeRoutingKV,
+  ContentMigrationState,
+  backfillContentIfIncomplete,
+  discoverContentScopesFromBin,
+  type ContentKvStore,
+} from "./state/content-kv-router.js";
 import type { IndexBlobStore } from "./state/index-blob-store.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
@@ -249,6 +255,7 @@ async function main() {
   let vectorIndex: VectorIndex | null = null;
   let indexBlobStore: IndexBlobStore | undefined;
   let graphKv: GraphKvStore | undefined;
+  let contentKv: ContentKvStore | undefined;
   if (embeddingProvider) {
     const backends = await createPersistenceBackends({
       kv: baseKv,
@@ -259,13 +266,24 @@ async function main() {
     vectorIndex = backends.vector;
     indexBlobStore = backends.blobStore;
     graphKv = backends.graphKv;
+    contentKv = backends.contentKv;
   }
 
-  // When a self-persisting backend owns its files (lancedb), route the graph's
-  // KV scopes to it - out of the iii KV - and migrate the existing graph once.
-  // Otherwise the graph stays in the iii KV via the plain StateKV. Every other
-  // scope always falls through to the iii KV regardless.
-  const kv = graphKv ? new GraphRoutingKV(sdk, graphKv) : baseKv;
+  // When a self-persisting backend owns its files (lancedb), route BOTH the
+  // graph scopes and the content scopes (memory/observation/session/summary)
+  // out of the lazy iii KV into their write-through LanceDB stores; every other
+  // scope falls through to the iii KV. The content migration state keeps reads
+  // falling back to iii until each scope is fully backfilled below. With the
+  // memory backend neither store exists and this is a plain StateKV.
+  const contentMigration = contentKv ? new ContentMigrationState() : undefined;
+  const kv =
+    graphKv || contentKv
+      ? new ScopeRoutingKV(sdk, {
+          graph: graphKv,
+          content: contentKv,
+          migration: contentMigration,
+        })
+      : baseKv;
   const metricsStore = new MetricsStore(kv);
   if (graphKv) {
     try {
@@ -278,6 +296,52 @@ async function main() {
     } catch (err) {
       bootLog(
         `Graph backfill skipped (error): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Content backfill MUST finish before any HTTP/cron/stream writer accepts
+  // traffic (those start later in main()), so a stale iii row can never
+  // overwrite a newer content_kv write. Idempotent + resumable via the per-
+  // scope manifest; a normal restart is a no-op. Dynamic obs/enriched scopes
+  // are discovered from the union of the on-disk .bin inventory and the iii
+  // session list.
+  if (contentKv && contentMigration) {
+    try {
+      const stateStoreDir =
+        process.env.AGENTMEMORY_STATE_STORE_DIR ||
+        join(process.cwd(), "data", "state_store.db");
+      const binScopes = discoverContentScopesFromBin(stateStoreDir);
+      const sessionRows = await baseKv
+        .list<{ id?: string }>(KV.sessions)
+        .catch(() => [] as Array<{ id?: string }>);
+      const sessionScopes: string[] = [];
+      for (const s of sessionRows) {
+        if (s && typeof s.id === "string" && s.id.length > 0) {
+          sessionScopes.push(KV.observations(s.id), KV.enrichedChunks(s.id));
+        }
+      }
+      const report = await backfillContentIfIncomplete(
+        baseKv,
+        contentKv,
+        contentMigration,
+        [...binScopes, ...sessionScopes],
+        bootLog,
+      );
+      // Backfill succeeded: content_kv is now authoritative for every scope, so
+      // drop the iii read-fallback entirely (steady state is content-only).
+      contentMigration.markAllComplete();
+      bootLog(
+        `Content backend: LanceDB (content_kv backfill ${report.totalCopied} copied / ` +
+          `${report.totalSource} source across ${report.scopes.length} scopes; ` +
+          `${report.staticScopes} static + ${report.dynamicScopes} dynamic)`,
+      );
+    } catch (err) {
+      // A failed backfill is load-bearing (content would be missing). Do NOT
+      // markAllComplete: leave the router in fallback mode so reads still serve
+      // from the iii KV, and surface the failure loudly.
+      bootLog(
+        `Content backfill FAILED (reads fall back to iii KV): ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -601,9 +665,10 @@ async function main() {
   // version; without periodic compaction the index accrues unbounded
   // fragments. Hourly optimize()+prune keeps it tight. No-op for the
   // in-memory backend; unref so it never holds the process open at exit.
-  if (vectorIndex || graphKv) {
+  if (vectorIndex || graphKv || contentKv) {
     const vi = vectorIndex;
     const gkv = graphKv;
+    const ckv = contentKv;
     const optimizeTimer = setInterval(
       () => {
         vi?.optimize().catch((err) => {
@@ -611,6 +676,9 @@ async function main() {
         });
         gkv?.optimize?.().catch((err) => {
           console.warn(`[agentmemory] graph kv optimize failed:`, err);
+        });
+        ckv?.optimize?.().catch((err) => {
+          console.warn(`[agentmemory] content kv optimize failed:`, err);
         });
       },
       60 * 60 * 1000,
