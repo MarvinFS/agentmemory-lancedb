@@ -319,15 +319,23 @@ export interface ContentBackfillReport {
   dynamicScopes: number;
 }
 
+// Stage-A quiesced export overlay: scope -> key -> value. Captures the live
+// daemon's RAM delta (saves not yet flushed to the on-disk .bin) so the Stage-B
+// boot backfill seeds content_kv from the UNION of iii (.bin) and this overlay,
+// with the overlay WINNING on conflict (it is the latest RAM state).
+export type ContentExportOverlay = Record<string, Record<string, unknown>>;
+
 export async function backfillContentIfIncomplete(
   source: StateKV,
   content: ContentKvStore,
   migration: ContentMigrationState,
   dynamicScopes: string[],
   log: (msg: string) => void = () => {},
+  overlay?: ContentExportOverlay,
 ): Promise<ContentBackfillReport> {
   const staticScopes = [KV.memories, KV.sessions, KV.summaries];
-  const dyn = Array.from(new Set(dynamicScopes))
+  const overlayScopes = overlay ? Object.keys(overlay) : [];
+  const dyn = Array.from(new Set([...dynamicScopes, ...overlayScopes]))
     .filter((s) => isContentScope(s) && !CONTENT_STATIC_SCOPES.has(s))
     .sort();
   const allScopes = [...staticScopes, ...dyn];
@@ -359,25 +367,31 @@ export async function backfillContentIfIncomplete(
       .list<Record<string, unknown>>(scope)
       .catch(() => [] as Array<Record<string, unknown>>);
 
-    const rows: Array<{ scope: string; key: string; value: unknown }> = [];
+    // Merge iii (.bin) with the Stage-A overlay, overlay winning per key (it is
+    // the newer RAM state). Keyed map collapses duplicates before the insert.
+    const merged = new Map<string, unknown>();
     for (const item of items) {
       const key = contentKeyOf(scope, item);
-      if (key === null) continue;
-      rows.push({ scope, key, value: item });
+      if (key !== null) merged.set(key, item);
     }
+    const overlayRows = overlay?.[scope];
+    if (overlayRows) {
+      for (const [key, value] of Object.entries(overlayRows)) merged.set(key, value);
+    }
+    const rows = Array.from(merged, ([key, value]) => ({ scope, key, value }));
     if (rows.length > 0) await content.bulkInsertIfAbsent(rows);
 
     const entry: ManifestEntry = {
       done: true,
-      sourceCount: items.length,
+      sourceCount: merged.size,
       copied: rows.length,
       at: new Date().toISOString(),
     };
     await content.set(MANIFEST_SCOPE, scope, entry);
     migration.markComplete(scope);
 
-    report.scopes.push({ scope, source: items.length, copied: rows.length, skipped: false });
-    report.totalSource += items.length;
+    report.scopes.push({ scope, source: merged.size, copied: rows.length, skipped: false });
+    report.totalSource += merged.size;
     report.totalCopied += rows.length;
   }
 

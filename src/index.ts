@@ -36,6 +36,7 @@ import {
   backfillContentIfIncomplete,
   discoverContentScopesFromBin,
   type ContentKvStore,
+  type ContentExportOverlay,
 } from "./state/content-kv-router.js";
 import type { IndexBlobStore } from "./state/index-blob-store.js";
 import { HybridSearch } from "./state/hybrid-search.js";
@@ -120,7 +121,7 @@ import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
-import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, unlinkSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -321,12 +322,30 @@ async function main() {
           sessionScopes.push(KV.observations(s.id), KV.enrichedChunks(s.id));
         }
       }
+      // Optional Stage-A overlay: the quiesced RAM export captured from the old
+      // daemon before the swap. Seeds content_kv from the UNION of iii (.bin)
+      // and this overlay, overlay winning. Absent on a normal restart.
+      let overlay: ContentExportOverlay | undefined;
+      const overlayPath = process.env.AGENTMEMORY_CONTENT_OVERLAY;
+      if (overlayPath) {
+        try {
+          overlay = JSON.parse(readFileSync(overlayPath, "utf8")) as ContentExportOverlay;
+          bootLog(
+            `Content overlay: loaded ${Object.keys(overlay).length} scopes from ${overlayPath}`,
+          );
+        } catch (e) {
+          bootLog(
+            `Content overlay load failed (${overlayPath}): ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
       const report = await backfillContentIfIncomplete(
         baseKv,
         contentKv,
         contentMigration,
         [...binScopes, ...sessionScopes],
         bootLog,
+        overlay,
       );
       // Backfill succeeded: content_kv is now authoritative for every scope, so
       // drop the iii read-fallback entirely (steady state is content-only).

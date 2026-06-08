@@ -379,4 +379,51 @@ describe.skipIf(!lancedbAvailable)("content_kv migration safety", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("Stage-B union backfill: overlay adds new rows and wins over iii", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentmemory-overlay-"));
+    try {
+      const content = await openContent(dir);
+      const { sdk, store } = makeFakeSdk();
+      const StateKVmod = await import("../src/state/kv.js");
+      const source = new StateKVmod.StateKV(sdk);
+
+      // iii (.bin) view.
+      store.set(
+        KV.memories,
+        new Map([
+          ["mem_old", { id: "mem_old", content: "disk" }],
+          ["mem_both", { id: "mem_both", content: "disk-stale" }],
+        ]),
+      );
+      // Stage-A overlay: a fresher copy of mem_both plus a RAM-only mem_ram.
+      const overlay = {
+        [KV.memories]: {
+          mem_both: { id: "mem_both", content: "ram-fresh" },
+          mem_ram: { id: "mem_ram", content: "ram-only" },
+        },
+      };
+
+      const migration = new ContentMigrationState();
+      const report = await backfillContentIfIncomplete(
+        source,
+        content,
+        migration,
+        [],
+        () => {},
+        overlay,
+      );
+      migration.markAllComplete();
+      expect((await content.get<{ content: string }>(KV.memories, "mem_old"))!.content).toBe("disk");
+      expect((await content.get<{ content: string }>(KV.memories, "mem_both"))!.content).toBe(
+        "ram-fresh",
+      ); // overlay wins
+      expect((await content.get<{ content: string }>(KV.memories, "mem_ram"))!.content).toBe(
+        "ram-only",
+      ); // overlay-only row present
+      expect(report.totalCopied).toBe(3);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
