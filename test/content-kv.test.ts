@@ -315,3 +315,68 @@ describe.skipIf(!lancedbAvailable)("backfillContentIfIncomplete", () => {
     }
   });
 });
+
+describe.skipIf(!lancedbAvailable)("content_kv migration safety", () => {
+  it("allKeys returns non-tombstone keys across scopes; drain resolves", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentmemory-allkeys-"));
+    try {
+      const c = await openContent(dir);
+      await c.set(KV.memories, "mem_k", { id: "mem_k" });
+      await c.set(KV.observations("s9"), "obs_k", { id: "obs_k" });
+      await c.set(KV.memories, "mem_dead", { id: "mem_dead" });
+      await c.delete(KV.memories, "mem_dead");
+      const keys = await c.allKeys();
+      expect(keys.has("mem_k")).toBe(true);
+      expect(keys.has("obs_k")).toBe(true);
+      expect(keys.has("mem_dead")).toBe(false); // tombstone excluded
+      await expect(c.drain()).resolves.toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("concurrent writes + optimize do not lose or corrupt rows", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentmemory-concurrent-"));
+    try {
+      const c = await openContent(dir);
+      const scope = KV.observations("burst");
+      const writes: Array<Promise<unknown>> = [];
+      for (let i = 0; i < 40; i++) {
+        writes.push(c.set(scope, `obs_${i}`, { id: `obs_${i}`, n: i }));
+        if (i % 10 === 0) writes.push(c.optimize());
+      }
+      await Promise.all(writes);
+      const rows = await c.list<{ id: string; n: number }>(scope);
+      expect(rows.length).toBe(40);
+      const ns = new Set(rows.map((r) => r.n));
+      for (let i = 0; i < 40; i++) expect(ns.has(i)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a delete during migration is not resurrected by a later backfill", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentmemory-noresurrect-"));
+    try {
+      const content = await openContent(dir);
+      const { sdk, store } = makeFakeSdk();
+      const StateKVmod = await import("../src/state/kv.js");
+      const source = new StateKVmod.StateKV(sdk);
+      const migration = new ContentMigrationState();
+      const kv = new ScopeRoutingKV(sdk, { content, migration });
+
+      // iii still holds the row; a post-cutover delete tombstones it in content.
+      store.set(KV.memories, new Map([["mem_x", { id: "mem_x" }]]));
+      await kv.delete(KV.memories, "mem_x");
+      expect(await kv.get(KV.memories, "mem_x")).toBeNull();
+
+      // Backfill (insert-only) must NOT overwrite the tombstone with stale iii.
+      await backfillContentIfIncomplete(source, content, migration, []);
+      migration.markAllComplete();
+      expect(await kv.get(KV.memories, "mem_x")).toBeNull();
+      expect((await content.allKeys()).has("mem_x")).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

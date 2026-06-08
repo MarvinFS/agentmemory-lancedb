@@ -346,6 +346,30 @@ async function main() {
     }
   }
 
+  // Ghost repair check: a vector-indexed id whose content never persisted (the
+  // memories/observation content lost from the dead process RAM) cannot expand.
+  // The read paths already drop such ids from results, so this is a non-mutating
+  // reconciliation that just logs the count for observability.
+  if (contentKv && vectorIndex) {
+    try {
+      const indexed = await vectorIndex.listLifecycle();
+      if (indexed.size > 0) {
+        const contentKeys = await contentKv.allKeys();
+        let ghosts = 0;
+        for (const id of indexed.keys()) if (!contentKeys.has(id)) ghosts++;
+        bootLog(
+          ghosts > 0
+            ? `Content ghost check: ${ghosts} of ${indexed.size} indexed ids have no content_kv body (filtered at read time)`
+            : `Content ghost check: all ${indexed.size} indexed ids have content`,
+        );
+      }
+    } catch (err) {
+      bootLog(
+        `Content ghost check skipped (error): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   setVectorIndex(vectorIndex);
   setEmbeddingProvider(embeddingProvider);
 
@@ -787,21 +811,55 @@ async function main() {
     bootLog(`Lifecycle sweep: enabled (maturity demotion + GC review, every ${lifecycleSweepIntervalMs / 3600000}h)`);
   }
 
-  const shutdown = async () => {
-    console.log(`\n[agentmemory] Shutting down...`);
-    healthMonitor.stop();
-    dedupMap.stop();
-    indexPersistence.stop();
-    await new Promise<void>((resolve) => viewerServer.close(() => resolve()));
-    await indexPersistence.save().catch((err) => {
-      console.warn(`[agentmemory] Failed to save index on shutdown:`, err);
+  // Shutdown is now a guard, not a flush dependency: content is already durable
+  // in content_kv on every write, so a slow or interrupted stop can no longer
+  // lose content. The clean stop is wrapped in a deadline; on exceed we exit
+  // NONZERO with a clear log rather than a silent process.exit(0) that would
+  // hide unfinished work (the silent exit masking a SIGKILL-truncated flush is
+  // what lost RAM-only content for weeks). The systemd TimeoutStopSec drop-in
+  // (see deploy/agentmemory-timeoutstop.conf) gives this deadline room.
+  const shutdownDeadlineMs =
+    parseInt(process.env.AGENTMEMORY_SHUTDOWN_DEADLINE_MS || "", 10) > 0
+      ? parseInt(process.env.AGENTMEMORY_SHUTDOWN_DEADLINE_MS || "", 10)
+      : 30000;
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n[agentmemory] Shutting down (${signal})...`);
+    const deadline = new Promise<"timeout">((resolve) => {
+      const t = setTimeout(() => resolve("timeout"), shutdownDeadlineMs);
+      t.unref?.();
     });
-    await sdk.shutdown();
+    const cleanup = (async (): Promise<"ok"> => {
+      healthMonitor.stop();
+      dedupMap.stop();
+      indexPersistence.stop();
+      await new Promise<void>((resolve) => viewerServer.close(() => resolve()));
+      // Drain any in-flight content_kv merge (already durable on disk; this only
+      // avoids interrupting a commit). No-op for the memory backend.
+      if (contentKv) await contentKv.drain().catch(() => {});
+      // The small scopes still in the iii KV are the only thing a clean flush is
+      // now load-bearing for; persist the sharded index.
+      await indexPersistence.save().catch((err) => {
+        console.warn(`[agentmemory] Failed to save index on shutdown:`, err);
+      });
+      await sdk.shutdown();
+      return "ok";
+    })();
+    const result = await Promise.race([cleanup, deadline]);
     clearWorkerPidfile();
+    if (result === "timeout") {
+      console.error(
+        `[agentmemory] Shutdown exceeded ${shutdownDeadlineMs}ms deadline; exiting nonzero. ` +
+          `Content is durable in content_kv regardless.`,
+      );
+      process.exit(1);
+    }
     process.exit(0);
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 main().catch((err) => {

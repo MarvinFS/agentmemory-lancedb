@@ -69,6 +69,13 @@ export interface ContentKvStore extends GraphKvStore {
   ): Promise<void>;
   // Non-tombstone row count for a scope (verification / observability).
   countScope(scope: string): Promise<number>;
+  // Every non-tombstone key across all scopes, for the boot ghost repair check
+  // (indexed ids absent from this set have no content and cannot expand).
+  allKeys(): Promise<Set<string>>;
+  // Resolve only once any in-flight write/delete/backfill/optimize on
+  // content_kv has settled - a shutdown drain. Content is already durable on
+  // disk per write; this only avoids interrupting a merge mid-commit.
+  drain(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

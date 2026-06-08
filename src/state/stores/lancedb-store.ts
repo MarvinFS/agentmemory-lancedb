@@ -898,6 +898,25 @@ class LanceContentKvStore implements ContentKvStore {
       await this.requireTable().optimize({ cleanupOlderThan: new Date() });
     });
   }
+
+  async allKeys(): Promise<Set<string>> {
+    // One full-table scan (boot-only): collect every non-tombstone key across
+    // all scopes for the ghost repair check.
+    const rows = await this.requireTable().query().select(["key", "value"]).toArray();
+    const out = new Set<string>();
+    for (const r of rows) {
+      if (typeof r.value === "string" && r.value !== CONTENT_TOMBSTONE) {
+        out.add(String(r.key));
+      }
+    }
+    return out;
+  }
+
+  async drain(): Promise<void> {
+    // Acquire and release the write lock: resolves only after any in-flight
+    // write/delete/backfill/optimize has settled.
+    await withKeyedLock(CONTENT_KV_LOCK, async () => {});
+  }
 }
 
 // Lessons vector table: a self-contained mirror of the memories vector path,
