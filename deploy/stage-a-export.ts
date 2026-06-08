@@ -14,7 +14,7 @@
 // correctness dependency.
 //
 // Run (after approval, against the live engine):
-//   ./node_modules/.bin/tsx deploy/stage-a-export.ts /home/marvinfs/aml-stage-a-overlay.json
+//   ./node_modules/.bin/tsx deploy/stage-a-export.ts ~/aml-stage-a-overlay.json
 //   ./node_modules/.bin/tsx deploy/stage-a-export.ts --check   # offline self-check, no engine
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
