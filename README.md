@@ -61,7 +61,7 @@
   <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-tools.svg"><img src="assets/tags/stat-tools.svg" alt="53 MCP tools" height="38" /></picture>
   <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-hooks.svg"><img src="assets/tags/stat-hooks.svg" alt="12 auto hooks" height="38" /></picture>
   <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-deps.svg"><img src="assets/tags/stat-deps.svg" alt="0 external DBs" height="38" /></picture>
-  <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-tests.svg"><img src="assets/tags/stat-tests.svg" alt="950+ tests passing" height="38" /></picture>
+  <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-tests.svg"><img src="assets/tags/stat-tests.svg" alt="1,390+ tests passing" height="38" /></picture>
 </p>
 
 <p align="center">
@@ -226,7 +226,7 @@ You explain the same architecture every session. You re-discover the same bugs. 
 npx @agentmemory/agentmemory
 ```
 
-> **New in v0.9.22** — Three new connect adapters (Qwen Code, Antigravity, Kiro), `AGENT_ID` multi-agent isolation with opt-in `AGENTMEMORY_AGENT_SCOPE=isolated` filtering, install ERESOLVE fixed, OpenAI thinking-model output handled, OpenCode auto-context + session creation, viewer graph settles on 1000+ nodes, 22 fixes total. Full notes in [CHANGELOG.md](CHANGELOG.md).
+Latest release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -242,10 +242,10 @@ npx @agentmemory/agentmemory
 
 | Adapter | P@5 | R@5 | Top-5 hit rate | p50 latency |
 |---|---|---|---|---|
-| **agentmemory hybrid** | **0.578** | **0.967** | **15 / 15** | 14 ms |
-| grep baseline | 0.267 | 0.967 | 15 / 15 | 0 ms |
+| **agentmemory hybrid** | **0.240** | **1.000** | **15 / 15** | 14 ms |
+| grep baseline | 0.227 | 0.967 | 15 / 15 | 0 ms |
 
-100% top-5 hit rate. **2.2×** better precision than the grep baseline on identical input. Full per-type breakdown: [`docs/benchmarks/2026-05-20-coding-agent-life-v1.md`](docs/benchmarks/2026-05-20-coding-agent-life-v1.md).
+100% top-5 hit rate at the **P@5 math ceiling** for this corpus (0.240, see scorecard). Hybrid retrieves every gold session; grep misses 1 of 2 gold on the multi-session temporal query. Lift is **recall + temporal**, not aggregate precision — this benchmark is small + gold-sparse, the larger LongMemEval-S below differentiates better. Full per-type breakdown + correction note: [`docs/benchmarks/2026-05-20-coding-agent-life-v1.md`](docs/benchmarks/2026-05-20-coding-agent-life-v1.md).
 
 **LongMemEval-S** (ICLR 2025, 500 questions)
 
@@ -426,6 +426,8 @@ npx @agentmemory/agentmemory import-jsonl ~/.claude/projects/-my-project/abc123.
 ```
 
 Imported sessions show up in the Replay picker alongside native ones. Under the hood each entry routes through the `mem::replay::load`, `mem::replay::sessions`, and `mem::replay::import-jsonl` iii functions — no side-channel servers.
+
+> **Heads-up if you rely on `import-jsonl` as your primary capture path:** Claude Code's `cleanupPeriodDays` (in `~/.claude/settings.json`, default **30**) auto-deletes JSONL transcripts older than that window from `~/.claude/projects/`. If you install agentmemory fresh on a months-old Claude Code history, anything older than 30 days is already gone before the first import. Either run `import-jsonl` on a cron, raise `cleanupPeriodDays` to something higher, or wire the auto-capture hooks (the default plugin install path) so each turn lands in agentmemory while the session is live and the JSONL cleanup stops mattering.
 
 ### Upgrade / Maintenance
 
@@ -1139,7 +1141,7 @@ Full registry: [workers.iii.dev](https://workers.iii.dev). Every worker there co
 | Prometheus / Grafana | iii OTEL + health monitor |
 | Custom plugin systems | `iii worker add <name>` |
 
-**118 source files · ~21,800 LOC · 950+ tests · 123 functions · 34 KV scopes** — all on three primitives. No `agentmemory plugin install`. The plugin system is iii itself.
+**174 source files · ~37,800 LOC · 1,390+ tests · 258 functions · 44 KV scopes** — all on three primitives. No `agentmemory plugin install`. The plugin system is iii itself.
 
 ---
 
@@ -1429,7 +1431,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-129 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+131 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1463,7 +1465,7 @@ Full endpoint list: [`src/triggers/api.ts`](src/triggers/api.ts)
 ```bash
 npm run dev               # Hot reload
 npm run build             # Production build
-npm test                  # 950+ tests
+npm test                  # 1,390+ tests
 npm run test:integration  # API tests (requires running services)
 ```
 

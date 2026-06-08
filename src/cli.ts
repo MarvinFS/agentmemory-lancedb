@@ -154,7 +154,12 @@ Options:
   --reset            Wipe ~/.agentmemory/preferences.json and re-run onboarding
   --tools all|core   Tool visibility (default: all = 51 tools; core = 8 essentials)
   --no-engine        Skip auto-starting iii-engine
-  --port <N>         Override REST port (default: 3111)
+  --port <N>         Override REST port (default: 3111). Streams (N+1), viewer
+                     (N+2), and iii engine (N+46023) auto-derive from N so a
+                     single flag relocates the whole quartet.
+  --instance <N>     Shortcut for --port (3111 + N*100) to run multiple
+                     daemons side-by-side without env gymnastics.
+                     --instance 1 -> 3211/3212/3213/49234, etc. (max N=50)
 
 Environment:
   AGENTMEMORY_URL              Full REST base URL (e.g. http://localhost:3111).
@@ -186,6 +191,23 @@ if (toolsIdx !== -1 && args[toolsIdx + 1]) {
 const portIdx = args.indexOf("--port");
 if (portIdx !== -1 && args[portIdx + 1]) {
   process.env["III_REST_PORT"] = args[portIdx + 1];
+}
+
+// `--instance N` picks a 100-port block off the 3111 base so multiple
+// agentmemory daemons can coexist on one host without env-var
+// gymnastics (#750). `--instance 0` keeps the canonical 3111/3112/3113/49134
+// quartet; `--instance 1` → 3211/3212/3213/49234; etc. REST acts as the
+// anchor — streams/viewer/engine derive from it via fixed offsets below
+// unless an env explicitly pins each one.
+const instanceIdx = args.indexOf("--instance");
+if (instanceIdx !== -1 && args[instanceIdx + 1]) {
+  const n = parseInt(args[instanceIdx + 1] || "", 10);
+  if (Number.isFinite(n) && n >= 0 && n <= 50) {
+    const base = 3111 + n * 100;
+    if (!process.env["III_REST_PORT"]) {
+      process.env["III_REST_PORT"] = String(base);
+    }
+  }
 }
 
 const skipEngine = args.includes("--no-engine");
@@ -255,17 +277,20 @@ function getViewerUrl(): string {
 // subscribe. Honors both `III_STREAM_PORT` (the singular name the
 // engine docs use post-0.11) and `III_STREAMS_PORT` (the name our
 // own config.ts has used since 0.7) so a single source of truth in
-// either form lights up the ready panel.
+// either form lights up the ready panel. Falls back to REST+1 so
+// `--port 3211` auto-picks 3212 instead of colliding on 3112 (#750).
 function getStreamPort(): number {
   return (
     parseInt(process.env["III_STREAM_PORT"] || "", 10) ||
     parseInt(process.env["III_STREAMS_PORT"] || "", 10) ||
-    3112
+    getRestPort() + 1
   );
 }
 
 // Bridge WebSocket port — the iii engine's internal worker bus.
-// Defaults to 49134 (engine convention) and is overridable via
+// Defaults derived from REST as REST+46023 so the canonical 3111
+// anchor yields 49134 and `--port 3211` auto-picks 49234 without a
+// second-instance collision (#750). Overridable via
 // `III_ENGINE_PORT` or the legacy `III_ENGINE_URL=ws://host:port`.
 function getEnginePort(): number {
   const explicit = parseInt(process.env["III_ENGINE_PORT"] || "", 10);
@@ -277,7 +302,7 @@ function getEnginePort(): number {
       if (parsed) return parseInt(parsed, 10);
     } catch {}
   }
-  return 49134;
+  return getRestPort() + 46023;
 }
 
 async function isEngineRunning(): Promise<boolean> {
@@ -628,8 +653,30 @@ function detectIiiConsole(): IiiConsoleState {
   return { kind: "missing" };
 }
 
+// The upstream install script reads `VERSION` as an env var (see
+// install.iii.dev/iii/main/install.sh: `engine_version="${VERSION:-}"`).
+// Pin to IIPINNED_VERSION so a fresh boot can never pull a newer iii
+// console that talks a different protocol than our pinned engine
+// (root cause of #712-class drift).
 const III_CONSOLE_INSTALL_CMD =
-  "curl -fsSL https://install.iii.dev/iii/main/install.sh | sh";
+  `curl -fsSL https://install.iii.dev/iii/main/install.sh | VERSION=${IIPINNED_VERSION} sh`;
+
+// Display-only renderer. The internal `runCommand(shBin, ["-c", ...])`
+// path uses III_CONSOLE_INSTALL_CMD verbatim (POSIX shell). Anywhere
+// that PRINTS the command to a user has to handle Windows separately
+// since `VERSION=X sh` and the pipe-to-sh idiom aren't valid in
+// cmd.exe / PowerShell.
+function iiiConsoleInstallHint(): string {
+  if (!IS_WINDOWS) return III_CONSOLE_INSTALL_CMD;
+  return (
+    `# PowerShell:\n` +
+    `  $env:VERSION = "${IIPINNED_VERSION}"\n` +
+    `  iwr -useb https://install.iii.dev/iii/main/install.sh -OutFile install.sh\n` +
+    `  bash install.sh   # WSL or Git Bash required\n` +
+    `# Or grab the pinned release directly:\n` +
+    `  https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}`
+  );
+}
 
 async function ensureIiiConsole(): Promise<IiiConsoleState> {
   const state = detectIiiConsole();
@@ -655,7 +702,7 @@ async function ensureIiiConsole(): Promise<IiiConsoleState> {
   const curlBin = whichBinary("curl");
   if (!shBin || !curlBin) {
     p.log.warn(
-      `curl or sh not found. Install manually:\n  ${III_CONSOLE_INSTALL_CMD}`,
+      `curl or sh not found. Install manually:\n  ${iiiConsoleInstallHint()}`,
     );
     return state;
   }
@@ -664,7 +711,7 @@ async function ensureIiiConsole(): Promise<IiiConsoleState> {
   });
   if (!ok) {
     p.log.warn(
-      `iii console install failed. Re-run manually:\n  ${III_CONSOLE_INSTALL_CMD}`,
+      `iii console install failed. Re-run manually:\n  ${iiiConsoleInstallHint()}`,
     );
     return state;
   }
@@ -1074,7 +1121,7 @@ function printReadyHint(consoleState: IiiConsoleState): void {
         // is, even when the binary isn't on PATH under the bare
         // name `iii-console`.
         `iii console  ${consoleState.binPath}  (run: ${consoleState.binPath} -p <port>)`
-      : `iii console  (install: ${III_CONSOLE_INSTALL_CMD})`;
+      : `iii console  (install: ${iiiConsoleInstallHint()})`;
 
   const lines = [
     `REST API     ${restUrl}`,
@@ -1207,7 +1254,7 @@ async function main() {
       p.note(
         [
           "Common causes:",
-          "  - iii-engine version mismatch — reinstall the latest binary",
+          `  - iii-engine version mismatch — reinstall the pinned v${IIPINNED_VERSION} binary`,
           "    (sh script on macOS/Linux, GitHub release zip on Windows)",
           "  - Docker Desktop not running (if you're using the Docker path)",
           "  - Port already in use (see below)",
@@ -2428,19 +2475,26 @@ async function runStop(): Promise<void> {
   }
 
   let allStopped = true;
+  // #843: stop worker first, then engine. The worker's shutdown
+  // handler calls indexPersistence.save() -> kv.set() -> iii state::set
+  // to flush BM25/vector snapshots + audit rows. Killing iii first
+  // leaves those writes with no engine to land on, and the index +
+  // observations end up as in-memory state the iii process never
+  // persists. Worker SIGTERM grace bumped 3s -> 5s to give a large
+  // index a real chance to commit before the engine goes away.
+  for (const pid of workerCandidates) {
+    const s = p.spinner();
+    s.start(`Stopping agentmemory worker (pid ${pid})... [flushing state]`);
+    const ok = await signalAndWait(pid, "SIGTERM", 5000);
+    s.stop(ok ? `Stopped worker pid ${pid}` : `Failed to stop worker pid ${pid}`);
+    if (!ok) allStopped = false;
+  }
   for (const pid of candidates) {
+    if (workerCandidates.has(pid)) continue;
     const s = p.spinner();
     s.start(`Stopping iii-engine (pid ${pid})...`);
     const ok = await signalAndWait(pid, "SIGTERM", 3000);
     s.stop(ok ? `Stopped pid ${pid}` : `Failed to stop pid ${pid}`);
-    if (!ok) allStopped = false;
-  }
-  for (const pid of workerCandidates) {
-    if (candidates.has(pid)) continue;
-    const s = p.spinner();
-    s.start(`Stopping agentmemory worker (pid ${pid})...`);
-    const ok = await signalAndWait(pid, "SIGTERM", 3000);
-    s.stop(ok ? `Stopped worker pid ${pid}` : `Failed to stop worker pid ${pid}`);
     if (!ok) allStopped = false;
   }
 

@@ -161,10 +161,24 @@ export function loadConfig(): AgentMemoryConfig {
 
   const provider = detectProvider(env);
 
+  // Port quartet: REST is the anchor; streams/engine derive from it
+  // unless individually overridden. Default anchor 3111 yields the
+  // canonical 3112 streams / 49134 engine pair, but `III_REST_PORT=3211`
+  // auto-picks 3212 + 49234 so a second instance doesn't collide (#750).
+  const restPort = parseInt(env["III_REST_PORT"] || "3111", 10) || 3111;
+  const streamsPort =
+    parseInt(env["III_STREAM_PORT"] || env["III_STREAMS_PORT"] || "", 10) ||
+    restPort + 1;
+  const engineUrl =
+    env["III_ENGINE_URL"] ||
+    `ws://localhost:${
+      parseInt(env["III_ENGINE_PORT"] || "", 10) || restPort + 46023
+    }`;
+
   return {
-    engineUrl: env["III_ENGINE_URL"] || "ws://localhost:49134",
-    restPort: parseInt(env["III_REST_PORT"] || "3111", 10) || 3111,
-    streamsPort: parseInt(env["III_STREAMS_PORT"] || "3112", 10) || 3112,
+    engineUrl,
+    restPort,
+    streamsPort,
     provider,
     tokenBudget: safeParseInt(env["TOKEN_BUDGET"], 2000),
     maxObservationsPerSession: safeParseInt(env["MAX_OBS_PER_SESSION"], 500),
