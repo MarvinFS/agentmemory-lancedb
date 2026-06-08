@@ -10,6 +10,7 @@ import type {
 import { KV } from "../state/schema.js";
 import { memoryToObservation } from "../state/memory-utils.js";
 import { StateKV } from "../state/kv.js";
+import { hasContentByKey } from "../state/content-kv-router.js";
 import { LESSON_SCORE_FLOOR } from "./lessons.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { recordAccessBatch } from "./access-tracker.js";
@@ -372,6 +373,18 @@ async function findObservation(
   // obsId for a saved memory resolves and skips the O(sessions) scan.
   const mem = (await kv.get<Memory>(KV.memories, obsId).catch(() => null)) ?? null;
   if (mem) return memoryToObservation(mem);
+
+  // Fast path: when content is routed to content_kv, resolve the obsId directly
+  // through its secondary `key` index across all `mem:obs:` scopes in a single
+  // lookup - no sessionId hint, no O(sessions) scan. Subsumes the #840 problem
+  // class. Falls through to the scan below for the memory backend (no content
+  // store) or when content_kv holds no such row.
+  if (hasContentByKey(kv)) {
+    const hit = await kv
+      .findContentByKey<CompressedObservation>(obsId, [], ["mem:obs:"])
+      .catch(() => null);
+    if (hit) return hit.value;
+  }
 
   const sessions = await kv.list<{ id: string }>(KV.sessions);
   for (let i = 0; i < sessions.length; i += 5) {
