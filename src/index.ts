@@ -837,10 +837,12 @@ async function main() {
   // hide unfinished work (the silent exit masking a SIGKILL-truncated flush is
   // what lost RAM-only content for weeks). The systemd TimeoutStopSec drop-in
   // (see deploy/agentmemory-timeoutstop.conf) gives this deadline room.
+  const parsedShutdownDeadline = parseInt(
+    process.env.AGENTMEMORY_SHUTDOWN_DEADLINE_MS || "",
+    10,
+  );
   const shutdownDeadlineMs =
-    parseInt(process.env.AGENTMEMORY_SHUTDOWN_DEADLINE_MS || "", 10) > 0
-      ? parseInt(process.env.AGENTMEMORY_SHUTDOWN_DEADLINE_MS || "", 10)
-      : 30000;
+    parsedShutdownDeadline > 0 ? parsedShutdownDeadline : 30000;
   let shuttingDown = false;
   const shutdown = async (signal: string) => {
     if (shuttingDown) return;

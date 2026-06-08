@@ -371,7 +371,7 @@ async function findObservation(
   // Saved memories (mem::remember) live in KV.memories under a synthetic
   // session, not KV.observations(*); resolve them before the scan so a bare
   // obsId for a saved memory resolves and skips the O(sessions) scan.
-  const mem = (await kv.get<Memory>(KV.memories, obsId).catch(() => null)) ?? null;
+  const mem = await kv.get<Memory>(KV.memories, obsId).catch(() => null);
   if (mem) return memoryToObservation(mem);
 
   // Fast path: when content is routed to content_kv, resolve the obsId directly

@@ -767,19 +767,31 @@ class LanceContentKvStore implements ContentKvStore {
     }
   }
 
-  async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
-    const row = {
-      pk: this.pk(scope, key),
-      scope,
-      key,
-      value: JSON.stringify(value),
-    };
+  // Upsert one fully-built row under the write lock: update-or-insert keyed on
+  // the composite pk, serialized against optimize() like every mutation. Shared
+  // by set (value = JSON) and delete (value = CONTENT_TOMBSTONE); the two differ
+  // only in the value column they write.
+  private async upsertRow(row: {
+    pk: string;
+    scope: string;
+    key: string;
+    value: string;
+  }): Promise<void> {
     await withKeyedLock(CONTENT_KV_LOCK, async () => {
       await this.requireTable()
         .mergeInsert("pk")
         .whenMatchedUpdateAll()
         .whenNotMatchedInsertAll()
         .execute([row]);
+    });
+  }
+
+  async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
+    await this.upsertRow({
+      pk: this.pk(scope, key),
+      scope,
+      key,
+      value: JSON.stringify(value),
     });
     return value;
   }
@@ -802,19 +814,14 @@ class LanceContentKvStore implements ContentKvStore {
   }
 
   async delete(scope: string, key: string): Promise<void> {
-    const row = {
+    // Tombstone, not a hard remove (see class comment): write CONTENT_TOMBSTONE
+    // into the value column rather than dropping the row, so a stale iii copy can
+    // never resurrect a post-cutover delete.
+    await this.upsertRow({
       pk: this.pk(scope, key),
       scope,
       key,
       value: CONTENT_TOMBSTONE,
-    };
-    await withKeyedLock(CONTENT_KV_LOCK, async () => {
-      // Tombstone, not a hard remove (see class comment).
-      await this.requireTable()
-        .mergeInsert("pk")
-        .whenMatchedUpdateAll()
-        .whenNotMatchedInsertAll()
-        .execute([row]);
     });
   }
 
