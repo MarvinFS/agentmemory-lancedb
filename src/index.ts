@@ -56,6 +56,9 @@ import {
   setVectorIndex,
   setEmbeddingProvider,
   setIndexPersistence,
+  vectorIndexRemove,
+  vectorIndexOptimize,
+  flushIndexSave,
 } from "./functions/search.js";
 import { registerContextFunction } from "./functions/context.js";
 import { registerSummarizeFunction } from "./functions/summarize.js";
@@ -197,6 +200,23 @@ async function main() {
 
   const embeddingProvider = createEmbeddingProvider();
   const imageEmbeddingProvider = createImageEmbeddingProvider();
+
+  // VECTOR_BACKEND=lancedb routes content durability (memories, observations,
+  // sessions, summaries) through the LanceDB write-through stores — but those
+  // backends are only constructed when an embedding provider resolves. Booting
+  // without one would silently revert every content write to the non-durable
+  // iii KV. Fail fast instead of degrading.
+  if (getVectorBackendKind() === "lancedb" && !embeddingProvider) {
+    console.error(
+      `[agentmemory] FATAL: VECTOR_BACKEND=lancedb but no embedding provider ` +
+        `resolved, so the LanceDB backends (including the content_kv ` +
+        `write-through that makes saves durable) cannot start. Set ` +
+        `EMBEDDING_PROVIDER or one of GEMINI_API_KEY / OPENAI_API_KEY / ` +
+        `VOYAGE_API_KEY / COHERE_API_KEY / OPENROUTER_API_KEY, or switch ` +
+        `VECTOR_BACKEND off lancedb explicitly.`,
+    );
+    process.exit(1);
+  }
 
   bootLog(`Starting worker v${VERSION}...`);
   bootLog(`Engine: ${config.engineUrl}`);
@@ -350,10 +370,18 @@ async function main() {
       // Backfill succeeded: content_kv is now authoritative for every scope, so
       // drop the iii read-fallback entirely (steady state is content-only).
       contentMigration.markAllComplete();
+      const skippedScopes = report.scopes.filter((s) => s.skipped).length;
       bootLog(
-        `Content backend: LanceDB (content_kv backfill ${report.totalCopied} copied / ` +
-          `${report.totalSource} source across ${report.scopes.length} scopes; ` +
-          `${report.staticScopes} static + ${report.dynamicScopes} dynamic)`,
+        skippedScopes === report.scopes.length && report.scopes.length > 0
+          ? `Content backend: LanceDB (content_kv: ${skippedScopes} scopes already ` +
+              `complete via manifest, 0 new)`
+          : `Content backend: LanceDB (content_kv backfill ${report.totalCopied} copied / ` +
+              `${report.totalSource} source across ${report.scopes.length} scopes; ` +
+              `${report.staticScopes} static + ${report.dynamicScopes} dynamic` +
+              (report.totalDropped > 0
+                ? `; ${report.totalDropped} rows DROPPED, no derivable key`
+                : "") +
+              `)`,
       );
     } catch (err) {
       // A failed backfill is load-bearing (content would be missing). Do NOT
@@ -368,17 +396,21 @@ async function main() {
   // Ghost repair check: a vector-indexed id whose content never persisted (the
   // memories/observation content lost from the dead process RAM) cannot expand.
   // The read paths already drop such ids from results, so this is a non-mutating
-  // reconciliation that just logs the count for observability.
+  // reconciliation that logs the count for observability. The ids are stashed
+  // for the flag-gated one-shot purge further down (after the persisted index
+  // is loaded). Steady state runs without the flag, so this check doubles as
+  // the loud alarm if ghosts ever reappear (a broken save-ordering invariant).
+  const ghostIds: string[] = [];
   if (contentKv && vectorIndex) {
     try {
       const indexed = await vectorIndex.listLifecycle();
       if (indexed.size > 0) {
         const contentKeys = await contentKv.allKeys();
-        let ghosts = 0;
-        for (const id of indexed.keys()) if (!contentKeys.has(id)) ghosts++;
+        for (const id of indexed.keys())
+          if (!contentKeys.has(id)) ghostIds.push(id);
         bootLog(
-          ghosts > 0
-            ? `Content ghost check: ${ghosts} of ${indexed.size} indexed ids have no content_kv body (filtered at read time)`
+          ghostIds.length > 0
+            ? `Content ghost check: ${ghostIds.length} of ${indexed.size} indexed ids have no content_kv body (filtered at read time)`
             : `Content ghost check: all ${indexed.size} indexed ids have content`,
         );
       }
@@ -704,6 +736,29 @@ async function main() {
     }
   }
 
+  // One-shot ghost purge (AGENTMEMORY_PURGE_GHOSTS=1): drop indexed ids with
+  // no content_kv body from both the BM25 and vector indexes so they stop
+  // wasting top-k slots. Must run AFTER indexPersistence.load() restored the
+  // persisted BM25 docs (the removals would otherwise be undone by the
+  // restore), using the same removal pair as the forget path. One flush +
+  // one compaction at the end — per-id flushes/optimizes would create
+  // thousands of Lance versions.
+  if (process.env.AGENTMEMORY_PURGE_GHOSTS === "1" && ghostIds.length > 0) {
+    for (const id of ghostIds) {
+      bm25Index.remove(id);
+      await vectorIndexRemove(id);
+    }
+    await flushIndexSave();
+    try {
+      await vectorIndexOptimize();
+    } catch (err) {
+      console.warn(`[agentmemory] post-purge optimize failed:`, err);
+    }
+    bootLog(
+      `Ghost purge: removed ${ghostIds.length} ids from vector+BM25 index`,
+    );
+  }
+
   // Periodic LanceDB compaction. Live writes each create a new on-disk
   // version; without periodic compaction the index accrues unbounded
   // fragments. Hourly optimize()+prune keeps it tight. No-op for the
@@ -852,6 +907,12 @@ async function main() {
       const t = setTimeout(() => resolve("timeout"), shutdownDeadlineMs);
       t.unref?.();
     });
+    // Set once everything load-bearing (content_kv drain + index save) has
+    // resolved. Past that point only sdk.shutdown() remains — the engine /
+    // LanceDB native threads refusing to stop is expected on this fork and
+    // loses nothing, so the deadline path can exit 0 instead of failing
+    // every routine systemd stop.
+    let durablesDrained = false;
     const cleanup = (async (): Promise<"ok"> => {
       healthMonitor.stop();
       dedupMap.stop();
@@ -865,15 +926,23 @@ async function main() {
       await indexPersistence.save().catch((err) => {
         console.warn(`[agentmemory] Failed to save index on shutdown:`, err);
       });
+      durablesDrained = true;
       await sdk.shutdown();
       return "ok";
     })();
     const result = await Promise.race([cleanup, deadline]);
     clearWorkerPidfile();
     if (result === "timeout") {
+      if (durablesDrained) {
+        console.log(
+          `[agentmemory] Shutdown drained (content_kv + index saved); engine/native ` +
+            `threads did not stop within ${shutdownDeadlineMs}ms deadline. Exiting 0.`,
+        );
+        process.exit(0);
+      }
       console.error(
-        `[agentmemory] Shutdown exceeded ${shutdownDeadlineMs}ms deadline; exiting nonzero. ` +
-          `Content is durable in content_kv regardless.`,
+        `[agentmemory] Shutdown exceeded ${shutdownDeadlineMs}ms deadline before the ` +
+          `drain completed; exiting nonzero. Content is durable in content_kv regardless.`,
       );
       process.exit(1);
     }

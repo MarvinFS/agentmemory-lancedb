@@ -114,6 +114,11 @@ const MEMORIES_TABLE = "memories";
 const BLOBS_TABLE = "index_blobs";
 const GRAPH_KV_TABLE = "graph_kv";
 const CONTENT_KV_TABLE = "content_kv";
+// Version-cleanup retention for optimize(): keep versions newer than 5 minutes
+// so a read that opened its snapshot just before a compaction can still
+// resolve it (cleanupOlderThan: new Date() would race such reads and fail
+// them on a pruned version).
+const OPTIMIZE_RETAIN = () => new Date(Date.now() - 5 * 60_000);
 // One keyed-mutex lock serializing every content_kv write/delete/backfill batch
 // against optimize(), so a compaction never overlaps an in-flight merge.
 const CONTENT_KV_LOCK = "content_kv";
@@ -372,7 +377,7 @@ class LanceVectorBackend implements VectorBackend {
   // everything older than now.
   async optimize(): Promise<void> {
     const table = this.requireTable();
-    await table.optimize({ cleanupOlderThan: new Date() });
+    await table.optimize({ cleanupOlderThan: OPTIMIZE_RETAIN() });
   }
 
   async validateDimensions(expected: number): Promise<DimensionReport> {
@@ -605,8 +610,8 @@ class LanceIndexBlobStore implements IndexBlobStore {
 // the graph its own on-disk files instead of the iii KV. Each node/edge/history
 // record is one row; the value column holds the JSON-serialized object, so the
 // stored shapes (GraphNode/GraphEdge) round-trip unchanged. The composite
-// identity is `scope + " " + key` in the `pk` column (neither a graph scope
-// nor a generated id contains a space), used ONLY as the mergeInsert match
+// identity is `scope + "\u0000" + key` in the `pk` column (a NUL byte can
+// appear in neither a scope nor a key), used ONLY as the mergeInsert match
 // key; get/delete filter on `scope AND key`, list filters on `scope`. Graph
 // ids collide across scopes (an edge and its history share a "ge_" id), so a
 // composite key is required.
@@ -643,7 +648,7 @@ class LanceGraphKvStore implements GraphKvStore {
   }
 
   private pk(scope: string, key: string): string {
-    return `${scope} ${key}`;
+    return `${scope}\u0000${key}`;
   }
 
   async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
@@ -696,7 +701,7 @@ class LanceGraphKvStore implements GraphKvStore {
   }
 
   async optimize(): Promise<void> {
-    await this.requireTable().optimize({ cleanupOlderThan: new Date() });
+    await this.requireTable().optimize({ cleanupOlderThan: OPTIMIZE_RETAIN() });
   }
 
   private parse<T>(v: unknown): T | null {
@@ -902,7 +907,7 @@ class LanceContentKvStore implements ContentKvStore {
 
   async optimize(): Promise<void> {
     await withKeyedLock(CONTENT_KV_LOCK, async () => {
-      await this.requireTable().optimize({ cleanupOlderThan: new Date() });
+      await this.requireTable().optimize({ cleanupOlderThan: OPTIMIZE_RETAIN() });
     });
   }
 
@@ -1053,7 +1058,7 @@ class LanceLessonVectorBackend implements LessonVectorBackend {
   }
 
   async optimize(): Promise<void> {
-    await this.requireTable().optimize({ cleanupOlderThan: new Date() });
+    await this.requireTable().optimize({ cleanupOlderThan: OPTIMIZE_RETAIN() });
   }
 }
 

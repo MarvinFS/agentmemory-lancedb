@@ -27,8 +27,10 @@ import { GRAPH_SCOPES, type GraphKvStore } from "./graph-kv-router.js";
 // hard-removing, so a stale iii copy (read-fallback during migration, or the
 // rollback export) can never resurrect a row that was deleted post-cutover. The
 // tombstone is encoded as a sentinel string in the `value` column that
-// JSON.stringify can never produce (a leading NUL byte), keeping the column a
-// plain non-null Utf8 exactly like the graph_kv table — no extra schema column.
+// JSON.stringify can never produce (its output is always quoted, braced,
+// bracketed, numeric, or a bare true/false/null — never a bare identifier),
+// keeping the column a plain non-null Utf8 exactly like the graph_kv table —
+// no extra schema column.
 export const CONTENT_TOMBSTONE = "__CONTENT_TOMBSTONE__";
 
 export interface ContentRawGet<T = unknown> {
@@ -99,12 +101,20 @@ export function isContentScope(scope: string): boolean {
 // iii `state::list` returns stored VALUES, not keys, so backfill must
 // reconstruct each row's key from the value's stable id field. Every routed
 // scope keys on `value.id` EXCEPT summaries, which key on `value.sessionId`
-// (summarize.ts writes `kv.set(KV.summaries, sessionId, summary)`).
+// (summarize.ts writes `kv.set(KV.summaries, sessionId, summary)`), and
+// enriched chunks, which key on `value.originalObsId` (sliding-window.ts
+// writes `kv.set(KV.enrichedChunks(sessionId), observationId, enriched)`
+// while the chunk's own `id` is a distinct `ec_*` value).
 export function contentKeyOf(scope: string, value: unknown): string | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
   if (scope === KV.summaries) {
     return typeof v.sessionId === "string" && v.sessionId.length > 0 ? v.sessionId : null;
+  }
+  if (scope.startsWith("mem:enriched:")) {
+    return typeof v.originalObsId === "string" && v.originalObsId.length > 0
+      ? v.originalObsId
+      : null;
   }
   return typeof v.id === "string" && v.id.length > 0 ? v.id : null;
 }
@@ -158,6 +168,10 @@ export class ContentMigrationState {
 
   isComplete(scope: string): boolean {
     return this.all || this.complete.has(scope);
+  }
+
+  isAllComplete(): boolean {
+    return this.all;
   }
 }
 
@@ -274,6 +288,19 @@ export class ScopeRoutingKV extends StateKV {
     if (!this.routes.content) return null;
     return this.routes.content.findByKey<T>(key, scopeExact, scopePrefixes);
   }
+
+  // True once the boot backfill marked every content scope complete: reads are
+  // then served exclusively from content_kv, so a findContentByKey miss is
+  // authoritative (no iii fallback could still hold the row). False during the
+  // migration window or after a failed backfill, where iii fallback reads are
+  // still live.
+  contentReadsAuthoritative(): boolean {
+    return (
+      !!this.routes.content &&
+      !!this.routes.migration &&
+      this.routes.migration.isAllComplete()
+    );
+  }
 }
 
 // Narrow runtime guard so consumers (smart-search) can opt into the bare-key
@@ -284,6 +311,17 @@ export function hasContentByKey(
   return (
     !!kv &&
     typeof (kv as { findContentByKey?: unknown }).findContentByKey === "function"
+  );
+}
+
+// Companion guard: true when the kv routes content AND the boot backfill has
+// completed, i.e. a findContentByKey miss proves the row does not exist.
+export function hasAuthoritativeContent(kv: unknown): boolean {
+  const k = kv as { contentReadsAuthoritative?: () => boolean };
+  return (
+    !!kv &&
+    typeof k.contentReadsAuthoritative === "function" &&
+    k.contentReadsAuthoritative()
   );
 }
 
@@ -308,6 +346,9 @@ export interface ContentBackfillScopeReport {
   scope: string;
   source: number;
   copied: number;
+  // Rows whose key could not be derived (contentKeyOf returned null) and were
+  // silently excluded from the copy — nonzero means source data was left behind.
+  dropped: number;
   skipped: boolean;
 }
 
@@ -315,6 +356,7 @@ export interface ContentBackfillReport {
   scopes: ContentBackfillScopeReport[];
   totalSource: number;
   totalCopied: number;
+  totalDropped: number;
   staticScopes: number;
   dynamicScopes: number;
 }
@@ -344,6 +386,7 @@ export async function backfillContentIfIncomplete(
     scopes: [],
     totalSource: 0,
     totalCopied: 0,
+    totalDropped: 0,
     staticScopes: staticScopes.length,
     dynamicScopes: dyn.length,
   };
@@ -358,6 +401,7 @@ export async function backfillContentIfIncomplete(
         scope,
         source: manifest.sourceCount ?? -1,
         copied: 0,
+        dropped: 0,
         skipped: true,
       });
       continue;
@@ -370,9 +414,11 @@ export async function backfillContentIfIncomplete(
     // Merge iii (.bin) with the Stage-A overlay, overlay winning per key (it is
     // the newer RAM state). Keyed map collapses duplicates before the insert.
     const merged = new Map<string, unknown>();
+    let dropped = 0;
     for (const item of items) {
       const key = contentKeyOf(scope, item);
       if (key !== null) merged.set(key, item);
+      else dropped++;
     }
     const overlayRows = overlay?.[scope];
     if (overlayRows) {
@@ -390,16 +436,29 @@ export async function backfillContentIfIncomplete(
     await content.set(MANIFEST_SCOPE, scope, entry);
     migration.markComplete(scope);
 
-    report.scopes.push({ scope, source: merged.size, copied: rows.length, skipped: false });
+    report.scopes.push({
+      scope,
+      source: merged.size,
+      copied: rows.length,
+      dropped,
+      skipped: false,
+    });
     report.totalSource += merged.size;
     report.totalCopied += rows.length;
+    report.totalDropped += dropped;
   }
 
   await content.optimize?.();
+  const skippedScopes = report.scopes.filter((s) => s.skipped).length;
   log(
-    `Content backfill: ${report.totalCopied} rows across ${allScopes.length} scopes ` +
-      `(${report.staticScopes} static + ${report.dynamicScopes} dynamic), ` +
-      `source total ${report.totalSource}`,
+    skippedScopes === report.scopes.length && report.scopes.length > 0
+      ? `Content backfill: ${skippedScopes} scopes already complete (manifest), 0 new`
+      : `Content backfill: ${report.totalCopied} rows across ${allScopes.length} scopes ` +
+          `(${report.staticScopes} static + ${report.dynamicScopes} dynamic, ` +
+          `${skippedScopes} already complete), source total ${report.totalSource}` +
+          (report.totalDropped > 0
+            ? `, ${report.totalDropped} rows DROPPED (no derivable key)`
+            : ""),
   );
   return report;
 }

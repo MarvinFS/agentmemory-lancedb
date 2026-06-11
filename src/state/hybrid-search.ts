@@ -99,7 +99,11 @@ export class HybridSearch {
     limit: number,
     entityHints?: string[],
   ): Promise<HybridSearchResult[]> {
-    const bm25Results = this.bm25.search(query, limit * 2);
+    // Candidate fetch depth follows the retrieval window (min 20), not the
+    // caller's limit, so the ghost-dropping enrich stage below always has
+    // spare candidates to backfill from.
+    const retrievalDepth = Math.max(limit, 20);
+    const bm25Results = this.bm25.search(query, retrievalDepth * 2);
 
     let vectorResults: Array<{
       obsId: string;
@@ -111,7 +115,7 @@ export class HybridSearch {
     if (this.vector && this.embeddingProvider && this.vector.size > 0) {
       try {
         queryEmbedding = await this.embeddingProvider.embed(query);
-        vectorResults = await this.vector.search(queryEmbedding, limit * 2);
+        vectorResults = await this.vector.search(queryEmbedding, retrievalDepth * 2);
       } catch {
         // fall through to BM25-only
       }
@@ -269,9 +273,10 @@ export class HybridSearch {
 
     combined.sort((a, b) => b.combinedScore - a.combinedScore);
 
-    const retrievalDepth = Math.max(limit, 20);
     const rerankWindow = 20;
-    const diversified = this.diversifyBySession(combined, retrievalDepth);
+    // Diversify over 2x depth so enrichResults has spare candidates to
+    // backfill from when indexed ids without a body (ghosts) are dropped.
+    const diversified = this.diversifyBySession(combined, retrievalDepth * 2);
     const enriched = await this.enrichResults(diversified, retrievalDepth);
 
     // --- Breadcrumb down-weight ---
@@ -392,7 +397,9 @@ export class HybridSearch {
     }>,
     limit: number,
   ): Promise<HybridSearchResult[]> {
-    const sliced = results.slice(0, limit);
+    // Over-fetch 2x: indexed ids without a resolvable body (ghosts) are
+    // dropped below, which would otherwise shrink the result set under limit.
+    const sliced = results.slice(0, limit * 2);
     const observations = await Promise.all(
       sliced.map(async (r) => {
         const obs = await this.kv
@@ -424,6 +431,6 @@ export class HybridSearch {
         });
       }
     }
-    return enriched;
+    return enriched.slice(0, limit);
   }
 }

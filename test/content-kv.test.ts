@@ -91,6 +91,19 @@ describe("content scope membership (pure)", () => {
     expect(contentKeyOf(KV.summaries, { sessionId: "s1", id: "ignored" })).toBe("s1");
     expect(contentKeyOf(KV.memories, { noId: true })).toBeNull();
   });
+
+  it("derives enriched-chunk keys from originalObsId, not the ec_* id", () => {
+    // sliding-window.ts stores chunks under key = observationId while the
+    // chunk's own id is a distinct ec_* value; keying backfill on id would
+    // re-home every chunk under a key no reader ever looks up.
+    expect(
+      contentKeyOf(KV.enrichedChunks("s1"), {
+        id: "ec_123",
+        originalObsId: "obs_9",
+      }),
+    ).toBe("obs_9");
+    expect(contentKeyOf(KV.enrichedChunks("s1"), { id: "ec_123" })).toBeNull();
+  });
 });
 
 describe.skipIf(!lancedbAvailable)("LanceContentKvStore (contract)", () => {
@@ -310,6 +323,104 @@ describe.skipIf(!lancedbAvailable)("backfillContentIfIncomplete", () => {
       );
       expect(report2.totalCopied).toBe(0);
       expect(report2.scopes.every((s) => s.skipped)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("backfills enriched chunks under the observation id, not the ec_* id", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentmemory-backfill-ec-"));
+    try {
+      const content = await openContent(dir);
+      const { sdk, store } = makeFakeSdk();
+      const StateKVmod = await import("../src/state/kv.js");
+      const source = new StateKVmod.StateKV(sdk);
+
+      // Shaped exactly like sliding-window.ts builds and stores it:
+      // kv.set(KV.enrichedChunks(sessionId), observationId, enriched).
+      const enriched = {
+        id: "ec_42",
+        originalObsId: "obs_primary",
+        sessionId: "ses_e",
+        content: "window summary",
+        resolvedEntities: [],
+        preferences: [],
+        contextBridges: [],
+        windowStart: 0,
+        windowEnd: 2,
+        createdAt: new Date().toISOString(),
+      };
+      const scope = KV.enrichedChunks("ses_e");
+      store.set(scope, new Map([["obs_primary", enriched]]));
+
+      const migration = new ContentMigrationState();
+      await backfillContentIfIncomplete(source, content, migration, [scope]);
+
+      // The row must be readable under the key every consumer uses (the
+      // observation id) and must NOT have been re-homed under the ec_* id.
+      expect(await content.get(scope, "obs_primary")).toEqual(enriched);
+      expect(await content.get(scope, "ec_42")).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("counts rows with no derivable key as dropped instead of hiding them", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentmemory-backfill-drop-"));
+    try {
+      const content = await openContent(dir);
+      const { sdk, store } = makeFakeSdk();
+      const StateKVmod = await import("../src/state/kv.js");
+      const source = new StateKVmod.StateKV(sdk);
+
+      store.set(
+        KV.memories,
+        new Map([
+          ["mem_ok", { id: "mem_ok" }],
+          ["mem_broken", { notAnId: true }], // contentKeyOf -> null
+        ]),
+      );
+
+      const report = await backfillContentIfIncomplete(
+        source,
+        content,
+        new ContentMigrationState(),
+        [],
+      );
+      const memScope = report.scopes.find((s) => s.scope === KV.memories);
+      expect(memScope?.copied).toBe(1);
+      expect(memScope?.dropped).toBe(1);
+      expect(report.totalDropped).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!lancedbAvailable)("LanceGraphKvStore pk separator", () => {
+  it("keeps the NUL composite separator (table identity regression guard)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentmemory-graphpk-"));
+    try {
+      const { graphKv } = await createLanceBackends({
+        kv: null as never,
+        dataDir: dir,
+        dimensions: DIMS,
+        backend: "lancedb",
+      });
+      if (!graphKv) throw new Error("graphKv missing from lancedb backends");
+      // Every existing graph_kv row on disk carries a NUL-separated pk; any
+      // accidental separator change orphans them all (mergeInsert would stop
+      // matching). Pin the exact byte.
+      const pk = (
+        graphKv as unknown as { pk(scope: string, key: string): string }
+      ).pk("a", "b");
+      expect(pk).toBe("a\u0000b");
+      // Behavioral collision guard: under a space separator (what the old
+      // comment claimed) these two pairs would encode identically.
+      await graphKv.set("g a", "b", { tag: "left" });
+      await graphKv.set("g", "a b", { tag: "right" });
+      expect((await graphKv.get<{ tag: string }>("g a", "b"))!.tag).toBe("left");
+      expect((await graphKv.get<{ tag: string }>("g", "a b"))!.tag).toBe("right");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

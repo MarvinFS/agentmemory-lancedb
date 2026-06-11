@@ -10,7 +10,7 @@ import type {
 import { KV } from "../state/schema.js";
 import { memoryToObservation } from "../state/memory-utils.js";
 import { StateKV } from "../state/kv.js";
-import { hasContentByKey } from "../state/content-kv-router.js";
+import { hasContentByKey, hasAuthoritativeContent } from "../state/content-kv-router.js";
 import { LESSON_SCORE_FLOOR } from "./lessons.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { recordAccessBatch } from "./access-tracker.js";
@@ -403,6 +403,12 @@ async function findObservation(
       .findContentByKey<CompressedObservation>(obsId, [], ["mem:obs:"])
       .catch(() => null);
     if (hit) return hit.value;
+    // Once the boot backfill completed, every `mem:obs:` read is served from
+    // content_kv exclusively - the O(sessions) scan below would re-read the
+    // same store and is guaranteed empty, so a miss here is the answer. The
+    // scan still runs during the migration window / after a failed backfill
+    // (iii fallback reads are then live) and for the memory backend.
+    if (hasAuthoritativeContent(kv)) return null;
   }
 
   const sessions = await kv.list<{ id: string }>(KV.sessions);

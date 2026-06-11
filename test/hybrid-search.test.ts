@@ -213,4 +213,36 @@ describe("HybridSearch", () => {
     expect(results[0].observation.narrative).toBe("Test memory for search");
     expect(results[0].observation.concepts).toEqual(["test", "search"]);
   });
+
+  it("over-fetches so bodyless indexed ids (ghosts) do not shrink the result set", async () => {
+    // 20 ghosts (no KV body) rank highest via stronger lexical match and fill
+    // the entire retrievalDepth window (max(limit, 20)); two real observations
+    // rank below them. Without the 2x over-fetch in diversify+enrich, the
+    // candidate window holds only ghosts and the search returns nothing.
+    for (let i = 0; i < 20; i++) {
+      bm25.add(
+        makeObs({
+          id: `ghost_${i}`,
+          sessionId: "ses_1",
+          title: "auth auth auth",
+          narrative: "auth auth auth auth auth",
+        }),
+      );
+    }
+    const real1 = makeObs({ id: "real_1", sessionId: "ses_1", title: "auth handler" });
+    const real2 = makeObs({ id: "real_2", sessionId: "ses_1", title: "auth config" });
+    bm25.add(real1);
+    bm25.add(real2);
+    await kv.set("mem:obs:ses_1", "real_1", real1);
+    await kv.set("mem:obs:ses_1", "real_2", real2);
+
+    const hybrid = new HybridSearch(bm25, null, null, kv as never);
+    const results = await hybrid.search("auth", 2);
+
+    expect(results.length).toBe(2);
+    expect(results.map((r) => r.observation.id).sort()).toEqual([
+      "real_1",
+      "real_2",
+    ]);
+  });
 });
